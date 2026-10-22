@@ -1,7 +1,0 @@
-# Versions actually used for the recorded test run on Windows / Python 3.12.15.
-fastapi==0.159.1
-uvicorn==0.54.0
-pymongo==4.19.0
-pydantic==2.14.1
-pytest==9.1.1
-httpx==0.28.1
