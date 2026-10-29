@@ -1,0 +1,96 @@
+{
+  "stage1_commit": "6021ad4cbe7261060658c62a627ac3acc30ec7a3",
+  "comparison": "UTF-8 text, platform line endings normalized",
+  "files": [
+    {
+      "path": "app/__init__.py",
+      "status": "unchanged",
+      "sha256": "01ba4719c80b6fe911b091a7c05124b64eeece964e09c058ef8f9805daca546b"
+    },
+    {
+      "path": "app/catalog.py",
+      "status": "added",
+      "sha256": "1556188ec3207589bf244e6798fde8d7d7b8b94315849dcafaeaac2fd09b5cc5"
+    },
+    {
+      "path": "app/catalog_models.py",
+      "status": "added",
+      "sha256": "db96516ed4f6f14aba0194630b1b8a9571c237d9bc7b9823e993c7ea4f1f75f8"
+    },
+    {
+      "path": "app/catalog_service.py",
+      "status": "added",
+      "sha256": "0ab8e63d1b3447f197e3c5295cd33035875d681153f18a45c78cdb13ced0e64a"
+    },
+    {
+      "path": "app/database.py",
+      "status": "modified",
+      "sha256": "47f4127b45632ce7b0414eb6d57dce9951e08419d380ea182378c1858cb7f679"
+    },
+    {
+      "path": "app/engine.py",
+      "status": "unchanged",
+      "sha256": "e94a83cadb95ff64dfc361352134287cb196ea958c87b423630ff403848c5ed1"
+    },
+    {
+      "path": "app/main.py",
+      "status": "modified",
+      "sha256": "5222cc5c91e3f0aae934119ecb59ab923c05d1110698c0a90c34993ca4ecb8ed"
+    },
+    {
+      "path": "app/models.py",
+      "status": "modified",
+      "sha256": "5bebce31d70a8ee79f91a78f75aff35f8eed9eaf55d8831048967fc4309e00e7"
+    },
+    {
+      "path": "app/static/app.js",
+      "status": "unchanged",
+      "sha256": "704fdd9c741e518b1d14e5d55104a62f65b07a0a4588de2458005b41dc09cf14"
+    },
+    {
+      "path": "app/static/catalog.js",
+      "status": "added",
+      "sha256": "953c46f4d2cb0e1603156704385b4e0ef995f19f0db888ec29537f0d72fb4ab0"
+    },
+    {
+      "path": "app/static/index.html",
+      "status": "modified",
+      "sha256": "0cf0b49952ab1b2b301425cb2caca9bcbebad1e59ebf4d531692a43790fef723"
+    },
+    {
+      "path": "app/static/style.css",
+      "status": "modified",
+      "sha256": "48c6f838ee7b1455c12de12bfe296233c30e2845dafa586650e78d9bc7871f66"
+    },
+    {
+      "path": "requirements-lock.txt",
+      "status": "unchanged",
+      "sha256": "1260245b62870deff650e743bd157e66bc34e47570402d0f760a7e77f626fafc"
+    },
+    {
+      "path": "requirements.txt",
+      "status": "unchanged",
+      "sha256": "aa827009c78c515f5d55efc002da8cb468d0800b9870d5f0b240b4d5df7083f1"
+    },
+    {
+      "path": "run.py",
+      "status": "unchanged",
+      "sha256": "abe5a539376ac00c04a9f7333ec2d773f054c6c7a891123958b7fd0636c683fc"
+    },
+    {
+      "path": "tests/test_api.py",
+      "status": "unchanged",
+      "sha256": "8b9009d7cf653949e197777149f7fc044212dd4a9fbab4cc36f09f1644ed186c"
+    },
+    {
+      "path": "tests/test_engine.py",
+      "status": "unchanged",
+      "sha256": "27730ba1a3370aad768f3911d5dce45911262cc59b1f9058603e4d7912b68bb8"
+    },
+    {
+      "path": "tests/test_stage2.py",
+      "status": "added",
+      "sha256": "6b27b12e5f5712b7d11eb1e152852e495814480b5d52d0a246eec9c9c4b76d6a"
+    }
+  ]
+}

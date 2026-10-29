@@ -1,0 +1,909 @@
+--- stage1/app/catalog.py
++++ stage2/app/catalog.py
+@@ -0,0 +1,250 @@
++from datetime import datetime, timezone
++from typing import Literal
++from bson import ObjectId
++from fastapi import APIRouter, Depends, HTTPException, Query
++from pymongo import ReturnDocument
++from pymongo.errors import DuplicateKeyError
++from .main import db, user, public, owned
++from .catalog_models import NewLibraryQuestion, NewVersion, ShareInput, ImportInput, BankInput, BankItemInput
++from .catalog_service import access_root, access_version, source_for, content, fingerprint, validate_definition, identifier
++
++router=APIRouter(prefix='/api',tags=['第二阶段题库与版本'])
++def now():
++    value=datetime.now(timezone.utc)
++    return value.replace(microsecond=value.microsecond//1000*1000)
++
++
++def create_root(body,account,database,derived=None):
++    definition=body.definition.model_dump()
++    validate_definition(definition)
++    root={'_id':ObjectId(),'owner_id':account['_id'],'next_version':1,'created_at':now()}
++    if derived: root['derived_from_version_id']=derived
++    version={'_id':ObjectId(),'root_id':root['_id'],'number':1,'definition':definition,'fingerprint':fingerprint(definition),'parent_version_id':None,'created_at':now(),'note':body.note}
++    database.question_roots.insert_one(root)
++    database.question_versions.insert_one(version)
++    return {'root':public(root),'version':public(version)}
++
++
++def insert_version(root,parent,definition,note,database,restored=False):
++    validate_definition(definition)
++    reserved=database.question_roots.find_one_and_update({'_id':root['_id']},{'$inc':{'next_version':1}},return_document=ReturnDocument.AFTER)
++    version={'root_id':root['_id'],'number':reserved['next_version'],'definition':definition,'fingerprint':fingerprint(definition),'parent_version_id':parent['_id'],'created_at':now(),'note':note}
++    if restored: version['restored_from_version_id']=parent['_id']
++    database.question_versions.insert_one(version)
++    return public(version)
++
++
++@router.get('/library/questions')
++def library_list(scope:Literal['all','owned','shared']='all',skip:int=Query(0,ge=0),limit:int=Query(50,ge=1,le=100),account=Depends(user),database=Depends(db)):
++    shared=[g['root_id'] for g in database.question_shares.find({'grantee_id':account['_id']})]
++    conditions={'owner_id':account['_id']} if scope=='owned' else {'_id':{'$in':shared},'owner_id':{'$ne':account['_id']}} if scope=='shared' else {'$or':[{'owner_id':account['_id']},{'_id':{'$in':shared}}]}
++    rows=[]
++    for root in database.question_roots.find(conditions).sort('created_at',-1).skip(skip).limit(limit):
++        latest=database.question_versions.find_one({'root_id':root['_id']},sort=[('number',-1)])
++        if latest: rows.append({**public(root),'is_owner':root['owner_id']==account['_id'],'latest':public(latest)})
++    return rows
++
++
++@router.post('/library/questions',status_code=201)
++def new_library(body:NewLibraryQuestion,account=Depends(user),database=Depends(db)):
++    return create_root(body,account,database)
++
++
++@router.get('/library/questions/{rid}')
++def detail(rid:str,account=Depends(user),database=Depends(db)):
++    root=access_root(rid,account,database)
++    versions=list(database.question_versions.find({'root_id':root['_id']}).sort('number',-1))
++    return {'root':public(root),'is_owner':root['owner_id']==account['_id'],'versions':public(versions)}
++
++
++@router.post('/library/questions/{rid}/versions',status_code=201)
++def new_version(rid:str,body:NewVersion,account=Depends(user),database=Depends(db)):
++    root=access_root(rid,account,database,True)
++    parent=database.question_versions.find_one({'_id':identifier(body.parent_version_id),'root_id':root['_id']})
++    if not parent: raise HTTPException(404,'父版本不属于该题目')
++    return insert_version(root,parent,body.definition.model_dump(),body.note,database)
++
++
++@router.post('/library/questions/{rid}/versions/{vid}/restore',status_code=201)
++def restore(rid:str,vid:str,account=Depends(user),database=Depends(db)):
++    root=access_root(rid,account,database,True)
++    parent=database.question_versions.find_one({'_id':identifier(vid),'root_id':root['_id']})
++    if not parent: raise HTTPException(404,'版本不存在')
++    return insert_version(root,parent,parent['definition'],'恢复自 v'+str(parent['number']),database,True)
++
++
++@router.post('/library/versions/{vid}/fork',status_code=201)
++def fork(vid:str,body:NewLibraryQuestion,account=Depends(user),database=Depends(db)):
++    _,version=access_version(vid,account,database)
++    return create_root(body,account,database,version['_id'])
++
++
++@router.post('/library/questions/{rid}/shares',status_code=201)
++def share(rid:str,body:ShareInput,account=Depends(user),database=Depends(db)):
++    root=access_root(rid,account,database,True)
++    recipient=database.users.find_one({'username':body.username})
++    if not recipient: raise HTTPException(404,'该用户名尚未注册')
++    if recipient['_id']==account['_id']: raise HTTPException(422,'无需共享给自己')
++    try:
++        database.question_shares.update_one({'root_id':root['_id'],'grantee_id':recipient['_id']},{'$setOnInsert':{'created_at':now()}},upsert=True)
++    except DuplicateKeyError:
++        pass  # Concurrent identical grants are idempotent; the unique row exists.
++    return {'username':recipient['username'],'shared':True}
++
++
++@router.get('/library/questions/{rid}/shares')
++def shares(rid:str,account=Depends(user),database=Depends(db)):
++    root=access_root(rid,account,database,True)
++    grants=list(database.question_shares.find({'root_id':root['_id']}))
++    names={u['_id']:u['username'] for u in database.users.find({'_id':{'$in':[g['grantee_id'] for g in grants]}})}
++    return [{'user_id':str(g['grantee_id']),'username':names.get(g['grantee_id'],'已失效账号'),'created_at':g['created_at'].isoformat()} for g in grants]
++
++
++@router.delete('/library/questions/{rid}/shares/{uid}')
++def unshare(rid:str,uid:str,account=Depends(user),database=Depends(db)):
++    root=access_root(rid,account,database,True)
++    database.question_shares.delete_one({'root_id':root['_id'],'grantee_id':identifier(uid)})
++    return {'ok':True,'message':'撤销未来取用权限，已导入的问卷快照继续可用'}
++
++
++@router.post('/surveys/{sid}/import-question',status_code=201)
++def import_question(sid:str,body:ImportInput,revision:int=Query(...,ge=1),account=Depends(user),database=Depends(db)):
++    survey=owned(sid,account,database)
++    _,version=access_version(body.version_id,account,database)
++    question={'id':body.local_id,**version['definition'],'rules':[],'source':source_for(version)}
++    doc=database.surveys.find_one_and_update({'_id':survey['_id'],'status':'draft','revision':revision,'questions.id':{'$ne':body.local_id},'questions.99':{'$exists':False}}, {'$push':{'questions':question},'$set':{'schema_version':2,'updated_at':now()},'$inc':{'revision':1}},return_document=ReturnDocument.AFTER)
++    if not doc: raise HTTPException(409,'草稿版本冲突、题号重复、已发布或题数超限')
++    return public(doc)
++
++
++@router.post('/surveys/{sid}/questions/{qid}/save-to-library',status_code=201)
++def save_existing(sid:str,qid:str,account=Depends(user),database=Depends(db)):
++    survey=owned(sid,account,database)
++    question=next((q for q in survey['questions'] if q['id']==qid),None)
++    if not question: raise HTTPException(404,'问卷内题目不存在')
++    # Saving a copy never silently relinks published history.
++    return create_root(NewLibraryQuestion(definition=content(question),note='保存自问卷 '+sid+' / '+qid),account,database)
++
++
++@router.get('/library/questions/{rid}/usage')
++def usage(rid:str,version_id:str|None=None,account=Depends(user),database=Depends(db)):
++    root=access_root(rid,account,database)
++    query={'questions.source.root_id':rid}
++    owner=root['owner_id']==account['_id']
++    if not owner: query['owner_id']=account['_id']
++    rows=[]
++    for survey in database.surveys.find(query,{'title':1,'status':1,'owner_id':1,'questions':1}):
++        local=[{'question_id':q['id'],'version_id':q['source']['version_id']} for q in survey['questions'] if q.get('source',{} ) and q['source']['root_id']==rid and (not version_id or q['source']['version_id']==version_id)]
++        if local:
++            mine=survey['owner_id']==account['_id']
++            rows.append({'survey_id':str(survey['_id']),'title':survey['title'] if mine else '其他用户问卷（内容受保护）','status':survey['status'],'is_owner':mine,'questions':local})
++    return {'root_id':rid,'surveys':rows,'scope':'all_usage_redacted' if owner else 'own_surveys'}
++
++
++@router.get('/banks')
++def banks(account=Depends(user),database=Depends(db)):
++    rows=list(database.question_banks.find({'owner_id':account['_id'],'archived':False}).sort('created_at',-1))
++    for row in rows: row['item_count']=database.bank_items.count_documents({'bank_id':row['_id']})
++    return public(rows)
++
++
++@router.post('/banks',status_code=201)
++def create_bank(body:BankInput,account=Depends(user),database=Depends(db)):
++    doc={**body.model_dump(),'owner_id':account['_id'],'revision':1,'archived':False,'created_at':now()}
++    database.question_banks.insert_one(doc)
++    return public(doc)
++
++
++def owned_bank(bid,account,database):
++    bank=database.question_banks.find_one({'_id':identifier(bid),'owner_id':account['_id'],'archived':False})
++    if not bank: raise HTTPException(404,'题库不存在或无权访问')
++    return bank
++
++
++@router.put('/banks/{bid}')
++def rename_bank(bid:str,body:BankInput,revision:int=Query(...,ge=1),account=Depends(user),database=Depends(db)):
++    owned_bank(bid,account,database)
++    bank=database.question_banks.find_one_and_update({'_id':identifier(bid),'revision':revision,'archived':False},{'$set':body.model_dump(),'$inc':{'revision':1}},return_document=ReturnDocument.AFTER)
++    if not bank: raise HTTPException(409,'题库版本冲突')
++    return public(bank)
++
++
++@router.delete('/banks/{bid}')
++def archive_bank(bid:str,account=Depends(user),database=Depends(db)):
++    bank=owned_bank(bid,account,database)
++    database.question_banks.update_one({'_id':bank['_id']},{'$set':{'archived':True},'$inc':{'revision':1}})
++    return {'ok':True,'message':'题库已归档，不删除题目版本和历史问卷'}
++
++
++@router.get('/banks/{bid}/items')
++def bank_items(bid:str,account=Depends(user),database=Depends(db)):
++    bank=owned_bank(bid,account,database)
++    rows=[]
++    for item in database.bank_items.find({'bank_id':bank['_id']}).sort('updated_at',-1):
++        try:
++            root,version=access_version(str(item['version_id']),account,database)
++            latest=database.question_versions.find_one({'root_id':root['_id']},sort=[('number',-1)])
++            rows.append({**public(item),'available':True,'version':public(version),'latest_version_id':str(latest['_id']),'has_update':latest['_id']!=version['_id']})
++        except HTTPException:
++            rows.append({**public(item),'available':False,'message':'共享已撤销，无法继续取用；已有问卷快照不受影响'})
++    return rows
++
++
++@router.post('/banks/{bid}/items',status_code=201)
++def add_bank_item(bid:str,body:BankItemInput,account=Depends(user),database=Depends(db)):
++    bank=owned_bank(bid,account,database)
++    root,version=access_version(body.version_id,account,database)
++    key={'bank_id':bank['_id'],'root_id':root['_id']}
++    try:
++        doc=database.bank_items.find_one_and_update(key,{'$set':{'version_id':version['_id'],'updated_at':now()}},upsert=True,return_document=ReturnDocument.AFTER)
++    except DuplicateKeyError:
++        doc=database.bank_items.find_one_and_update(key,{'$set':{'version_id':version['_id'],'updated_at':now()}},return_document=ReturnDocument.AFTER)
++    return public(doc)
++
++
++@router.delete('/banks/{bid}/items/{rid}')
++def remove_bank_item(bid:str,rid:str,account=Depends(user),database=Depends(db)):
++    bank=owned_bank(bid,account,database)
++    database.bank_items.delete_one({'bank_id':bank['_id'],'root_id':identifier(rid)})
++    return {'ok':True}
++
++
++def observation_pipeline(rid,vid,account,scope):
++    match={'questions.source.root_id':rid}
++    if scope=='mine': match['owner_id']=account['_id']
++    return [{'$match':match},{'$unwind':'$questions'},{'$match':{'questions.source.version_id':vid}},
++        {'$lookup':{'from':'responses','localField':'_id','foreignField':'survey_id','as':'response'}},{'$unwind':'$response'},
++        {'$project':{'survey_id':'$_id','local_id':'$questions.id','mine':{'$eq':['$owner_id',account['_id']]},'submitted_at':'$response.submitted_at','kv':{'$arrayElemAt':[{'$filter':{'input':{'$objectToArray':'$response.answers'},'as':'pair','cond':{'$eq':['$$pair.k','$questions.id']}}},0]}}},
++        {'$match':{'kv.v':{'$exists':True}}},{'$project':{'_id':0,'survey_id':1,'local_id':1,'mine':1,'submitted_at':1,'value':'$kv.v'}}]
++
++
++@router.get('/library/questions/{rid}/stats')
++def catalog_stats(rid:str,scope:Literal['mine','all']='mine',version_id:str|None=None,skip:int=Query(0,ge=0),limit:int=Query(100,ge=1,le=1000),account=Depends(user),database=Depends(db)):
++    root=access_root(rid,account,database)
++    if scope=='all' and root['owner_id']!=account['_id']: raise HTTPException(403,'只有题目所有者可查看全局聚合；其他用户仅可统计自己的问卷')
++    query={'root_id':root['_id']}
++    if version_id: query['_id']=identifier(version_id)
++    versions=list(database.question_versions.find(query).sort('number',1))
++    if version_id and not versions: raise HTTPException(404,'版本不属于该题')
++    results=[]
++    for version in versions:
++        pipeline=observation_pipeline(rid,str(version['_id']),account,scope)
++        counts=list(database.surveys.aggregate(pipeline+[{'$group':{'_id':None,'answered':{'$sum':1},'surveys':{'$addToSet':'$survey_id'}}}]))
++        item={'version_id':str(version['_id']),'number':version['number'],'fingerprint':version['fingerprint'],'definition':version['definition'],'answered':counts[0]['answered'] if counts else 0,'survey_count':len(counts[0]['surveys']) if counts else 0}
++        kind=version['definition']['type']
++        if kind in ('single','multiple'):
++            stages=pipeline+([{'$unwind':'$value'}] if kind=='multiple' else [])+[{'$group':{'_id':'$value','count':{'$sum':1}}}]
++            values={x['_id']:x['count'] for x in database.surveys.aggregate(stages)}
++            item['options']=[{'label':o,'count':values.get(o,0)} for o in version['definition']['options']]
++        else:
++            # Global aggregates never reveal another author's raw free text.
++            own=pipeline+([{'$match':{'mine':True}}] if scope=='all' else [])
++            vals=list(database.surveys.aggregate(own+[{'$sort':{'submitted_at':-1,'survey_id':1,'local_id':1}},{'$skip':skip},{'$limit':limit}]))
++            item.update(values=[x['value'] for x in vals],skip=skip,limit=limit,values_scope='own_surveys')
++            own_count=list(database.surveys.aggregate(own+[{'$count':'n'}]))
++            item['own_values_count']=own_count[0]['n'] if own_count else 0
++            if kind=='number':
++                numbers=list(database.surveys.aggregate(pipeline+[{'$group':{'_id':None,'average':{'$avg':'$value'},'min':{'$min':'$value'},'max':{'$max':'$value'}}}]))
++                item.update({k:numbers[0][k] if numbers else None for k in ['average','min','max']})
++        results.append(item)
++    return {'root_id':rid,'scope':scope,'grouping':'exact_version','versions':results,'notice':'按确切题目版本统计，不合并不同含义版本；全局仅共享聚合，原始填空内容仅来自自己的问卷。'}
+--- stage1/app/catalog_models.py
++++ stage2/app/catalog_models.py
+@@ -0,0 +1,51 @@
++from pydantic import Field, field_validator
++from .models import StrictModel, Limits
++from typing import Literal
++
++
++class Definition(StrictModel):
++    title: str = Field(min_length=1, max_length=300)
++    type: Literal['single', 'multiple', 'text', 'number']
++    required: bool = True
++    options: list[str] = Field(default_factory=list, max_length=100)
++    validation: Limits = Field(default_factory=Limits)
++
++    @field_validator('title')
++    @classmethod
++    def nonblank(cls, v):
++        if not v.strip(): raise ValueError('标题不能为空')
++        return v.strip()
++
++
++class NewLibraryQuestion(StrictModel):
++    definition: Definition
++    note: str = Field(default='', max_length=1000)
++
++
++class NewVersion(NewLibraryQuestion):
++    parent_version_id: str = Field(pattern=r'^[a-f0-9]{24}$')
++
++
++class ShareInput(StrictModel):
++    username: str = Field(min_length=3, max_length=40)
++
++
++class ImportInput(StrictModel):
++    version_id: str = Field(pattern=r'^[a-f0-9]{24}$')
++    local_id: str = Field(pattern=r'^[a-zA-Z][a-zA-Z0-9_]{0,39}$')
++
++
++class BankInput(StrictModel):
++    name: str = Field(min_length=1, max_length=120)
++    description: str = Field(default='', max_length=2000)
++
++    @field_validator('name')
++    @classmethod
++    def nonblank(cls, v):
++        if not v.strip(): raise ValueError('题库名称不能为空')
++        return v.strip()
++
++
++class BankItemInput(StrictModel):
++    version_id: str = Field(pattern=r'^[a-f0-9]{24}$')
++
+--- stage1/app/catalog_service.py
++++ stage2/app/catalog_service.py
+@@ -0,0 +1,57 @@
++"""Version identity and snapshot binding, independent of HTTP routing."""
++import hashlib
++import json
++from bson import ObjectId
++from fastapi import HTTPException
++from .catalog_models import Definition
++from .engine import inspect_rules
++
++
++def identifier(value):
++    if not ObjectId.is_valid(value): raise HTTPException(404,'资源不存在')
++    return ObjectId(value)
++
++
++def content(question):
++    return Definition(**{k:question[k] for k in ['title','type','required','options','validation']}).model_dump()
++
++
++def fingerprint(definition):
++    return hashlib.sha256(json.dumps(definition,sort_keys=True,ensure_ascii=False,separators=(',',':'),allow_nan=False).encode()).hexdigest()
++
++
++def validate_definition(definition):
++    result=inspect_rules([{'id':'item',**definition,'rules':[]}])
++    if not result['valid']: raise HTTPException(422,result)
++
++
++def access_root(root_id,account,database,owner_only=False):
++    root=database.question_roots.find_one({'_id':identifier(root_id)})
++    allowed=root and (root['owner_id']==account['_id'] or (not owner_only and database.question_shares.find_one({'root_id':root['_id'],'grantee_id':account['_id']})))
++    if not allowed: raise HTTPException(404,'题目不存在或没有权限')
++    return root
++
++
++def access_version(version_id,account,database):
++    version=database.question_versions.find_one({'_id':identifier(version_id)})
++    if not version: raise HTTPException(404,'题目版本不存在')
++    root=access_root(str(version['root_id']),account,database)
++    return root,version
++
++
++def source_for(version):
++    return {'root_id':str(version['root_id']),'version_id':str(version['_id']),'fingerprint':version['fingerprint']}
++
++
++def bind_sources(questions,account,database,existing=None):
++    """Never trust a client-provided source label for cross-survey aggregation."""
++    old_sources={q['id']:q.get('source') for q in (existing or {}).get('questions',[]) if q.get('source')}
++    for question in questions:
++        source=question.get('source')
++        if source is None: continue
++        version=database.question_versions.find_one({'_id':identifier(source['version_id']),'root_id':identifier(source['root_id'])})
++        if not version or source!=source_for(version) or content(question)!=version['definition']:
++            raise HTTPException(422,'引用题目的内容与不可变版本不一致；请另存新版本，或解除引用作为本地题')
++        if source != old_sources.get(question['id']):
++            access_root(source['root_id'],account,database)
++    return questions
+--- stage1/app/database.py
++++ stage2/app/database.py
+@@ -13,8 +13,13 @@
+     definitions = {
+         'users': {'required':['username','password_hash','created_at'], 'properties':{'username':{'bsonType':'string'},'password_hash':{'bsonType':'string'},'created_at':{'bsonType':'date'}}},
+         'sessions': {'required':['token_hash','user_id','expires_at'], 'properties':{'token_hash':{'bsonType':'string'},'user_id':{'bsonType':'objectId'},'expires_at':{'bsonType':'date'}}},
+-        'surveys': {'required':['owner_id','title','status','questions','schema_version','revision'], 'properties':{'owner_id':{'bsonType':'objectId'},'title':{'bsonType':'string'},'status':{'enum':['draft','published','closed']},'questions':{'bsonType':'array'},'schema_version':{'enum':[1]},'revision':{'bsonType':'int'}}},
++        'surveys': {'required':['owner_id','title','status','questions','schema_version','revision'], 'properties':{'owner_id':{'bsonType':'objectId'},'title':{'bsonType':'string'},'status':{'enum':['draft','published','closed']},'questions':{'bsonType':'array'},'schema_version':{'enum':[1,2]},'revision':{'bsonType':'int'}}},
+         'responses': {'required':['survey_id','survey_revision','respondent_key','request_id','answers','path','submitted_at'], 'properties':{'survey_id':{'bsonType':'objectId'},'survey_revision':{'bsonType':'int'},'respondent_key':{'bsonType':'string'},'answers':{'bsonType':'object'},'path':{'bsonType':'array'},'submitted_at':{'bsonType':'date'}}},
++        'question_roots': {'required':['owner_id','next_version','created_at'], 'properties':{'owner_id':{'bsonType':'objectId'},'next_version':{'bsonType':'int'},'created_at':{'bsonType':'date'}}},
++        'question_versions': {'required':['root_id','number','definition','fingerprint','created_at'], 'properties':{'root_id':{'bsonType':'objectId'},'number':{'bsonType':'int'},'definition':{'bsonType':'object'},'fingerprint':{'bsonType':'string'},'parent_version_id':{'bsonType':['objectId','null']},'created_at':{'bsonType':'date'}}},
++        'question_shares': {'required':['root_id','grantee_id','created_at'], 'properties':{'root_id':{'bsonType':'objectId'},'grantee_id':{'bsonType':'objectId'},'created_at':{'bsonType':'date'}}},
++        'question_banks': {'required':['owner_id','name','revision','archived'], 'properties':{'owner_id':{'bsonType':'objectId'},'name':{'bsonType':'string'},'revision':{'bsonType':'int'},'archived':{'bsonType':'bool'}}},
++        'bank_items': {'required':['bank_id','root_id','version_id','updated_at'], 'properties':{'bank_id':{'bsonType':'objectId'},'root_id':{'bsonType':'objectId'},'version_id':{'bsonType':'objectId'},'updated_at':{'bsonType':'date'}}},
+     }
+     existing = db.list_collection_names()
+     for name, schema in definitions.items():
+@@ -31,4 +36,15 @@
+     db.responses.create_index([('survey_id',ASCENDING),('submitted_at',DESCENDING)],name='survey_time')
+     db.responses.create_index([('survey_id',ASCENDING),('respondent_key',ASCENDING),('request_id',ASCENDING)],unique=True,name='uq_idempotency')
+     db.responses.create_index([('survey_id',ASCENDING),('single_key',ASCENDING)],unique=True,partialFilterExpression={'single_key':{'$type':'string'}},name='uq_single_response')
++    db.question_roots.create_index([('owner_id',1),('created_at',-1)],name='root_owner_recent')
++    db.question_versions.create_index([('root_id',1),('number',-1)],unique=True,name='uq_root_version')
++    db.question_versions.create_index('parent_version_id',name='version_parent')
++    db.question_shares.create_index([('root_id',1),('grantee_id',1)],unique=True,name='uq_root_grantee')
++    db.question_shares.create_index([('grantee_id',1),('created_at',-1)],name='grantee_roots')
++    db.question_banks.create_index([('owner_id',1),('archived',1)],name='owner_active_banks')
++    db.bank_items.create_index([('bank_id',1),('root_id',1)],unique=True,name='uq_bank_root')
++    db.surveys.create_index('questions.source.root_id',name='question_root_usage')
++    db.surveys.create_index('questions.source.version_id',name='question_version_usage')
++    # Idempotent additive migration: old surveys/responses remain untouched.
++    db.migrations.update_one({'_id':'stage2_catalog_v1'},{'$setOnInsert':{'description':'Added catalog collections and indexes; legacy snapshots retained'}},upsert=True)
+ 
+--- stage1/app/main.py
++++ stage2/app/main.py
+@@ -17,6 +17,7 @@
+ from .database import connect, initialize
+ from .models import Account, SurveyInput, Submission, Preview, Question
+ from .engine import inspect_rules, walk, AnswerError
++from .catalog_service import bind_sources
+ 
+ UTC = timezone.utc
+ ROOT = Path(__file__).parent
+@@ -48,7 +49,7 @@
+     yield
+     client.close()
+ 
+-app = FastAPI(title='问序 SurveyFlow · 第一阶段',version='1.0.0',lifespan=lifespan)
++app = FastAPI(title='问序 SurveyFlow · 第二阶段',version='2.0.0',lifespan=lifespan)
+ app.mount('/static',StaticFiles(directory=ROOT/'static'),name='static')
+ 
+ @app.middleware('http')
+@@ -113,7 +114,7 @@
+ @app.get('/api/health')
+ def health(database=Depends(db)):
+     database.command('ping')
+-    return {'status':'ok','database':database.name,'schema_version':1}
++    return {'status':'ok','database':database.name,'schema_version':2,'legacy_schema_versions':[1]}
+ 
+ @app.post('/api/auth/register',status_code=201)
+ def register(body:Account,database=Depends(db)):
+@@ -148,7 +149,8 @@
+ @app.post('/api/surveys',status_code=201)
+ def create(body:SurveyInput,account=Depends(user),database=Depends(db)):
+     doc=body.model_dump()
+-    doc.update(owner_id=account['_id'],status='draft',schema_version=1,revision=1,created_at=now(),updated_at=now(),submission_seq=0)
++    bind_sources(doc['questions'],account,database)
++    doc.update(owner_id=account['_id'],status='draft',schema_version=2,revision=1,created_at=now(),updated_at=now(),submission_seq=0)
+     database.surveys.insert_one(doc)
+     return public(doc)
+ 
+@@ -158,14 +160,17 @@
+ 
+ @app.put('/api/surveys/{sid}')
+ def update(sid:str,body:SurveyInput,revision:int=Query(...,ge=1),account=Depends(user),database=Depends(db)):
+-    owned(sid,account,database)
+-    result=database.surveys.find_one_and_update({'_id':oid(sid),'owner_id':account['_id'],'status':'draft','revision':revision},{'$set':{**body.model_dump(),'updated_at':now()},'$inc':{'revision':1}},return_document=ReturnDocument.AFTER)
++    survey=owned(sid,account,database)
++    data=body.model_dump()
++    bind_sources(data['questions'],account,database,survey)
++    result=database.surveys.find_one_and_update({'_id':oid(sid),'owner_id':account['_id'],'status':'draft','revision':revision},{'$set':{**data,'schema_version':2,'updated_at':now()},'$inc':{'revision':1}},return_document=ReturnDocument.AFTER)
+     if not result: raise HTTPException(409,'仅可修改草稿，或版本已变化，请刷新后重试')
+     return public(result)
+ 
+ @app.post('/api/surveys/{sid}/questions')
+ def add_question(sid:str,body:Question,revision:int=Query(...,ge=1),account=Depends(user),database=Depends(db)):
+     survey=owned(sid,account,database)
++    bind_sources([body.model_dump()],account,database)
+     if any(q['id']==body.id for q in survey['questions']): raise HTTPException(409,'题目 ID 已存在')
+     result=database.surveys.find_one_and_update({'_id':oid(sid),'status':'draft','revision':revision,'questions.id':{'$ne':body.id},'questions.99':{'$exists':False}}, {'$push':{'questions':body.model_dump()},'$inc':{'revision':1},'$set':{'updated_at':now()}},return_document=ReturnDocument.AFTER)
+     if not result: raise HTTPException(409,'草稿版本冲突、已发布或题目超过100道')
+@@ -258,3 +263,8 @@
+     owned(sid,account,database)
+     # Internal deduplication keys never leave the server.
+     return public(list(database.responses.find({'survey_id':oid(sid)},{'respondent_key':0,'single_key':0,'request_id':0}).sort('submitted_at',-1).skip(skip).limit(limit)))
++
++
++# The stage-two router extends the same application; stage-one endpoints remain.
++from .catalog import router as catalog_router
++app.include_router(catalog_router)
+--- stage1/app/models.py
++++ stage2/app/models.py
+@@ -29,6 +29,12 @@
+     target: str = Field(min_length=1, max_length=40)
+ 
+ 
++class QuestionSource(StrictModel):
++    root_id: str = Field(pattern=r'^[a-f0-9]{24}$')
++    version_id: str = Field(pattern=r'^[a-f0-9]{24}$')
++    fingerprint: str = Field(pattern=r'^[a-f0-9]{64}$')
++
++
+ class Question(StrictModel):
+     id: str = Field(pattern=r'^[a-zA-Z][a-zA-Z0-9_]{0,39}$')
+     title: str = Field(min_length=1, max_length=300)
+@@ -37,6 +43,7 @@
+     options: list[str] = Field(default_factory=list, max_length=100)
+     validation: Limits = Field(default_factory=Limits)
+     rules: list[Rule] = Field(default_factory=list, max_length=50)
++    source: QuestionSource | None = None
+ 
+     @field_validator('title')
+     @classmethod
+--- stage1/app/static/catalog.js
++++ stage2/app/static/catalog.js
+@@ -0,0 +1,77 @@
++'use strict';
++// Stage two extends the existing editor and route, rather than replacing them.
++const stageOneRoute=route;
++const stageOneToast=toast;
++toast=function(message){
++  const active=document.getElementById('catalog-dialog');
++  if(active?.open){
++    let output=active.querySelector('.dialog-error');
++    if(!output){output=document.createElement('p');output.className='dialog-error form-error';output.setAttribute('role','status');active.appendChild(output)}
++    output.textContent=message;
++  }else stageOneToast(message);
++};
++route=async function(){
++  if(!account)return auth();
++  if(location.hash==='#library')return guard(()=>libraryPage());
++  if(location.hash==='#banks')return guard(banksPage);
++  return stageOneRoute();
++};
++window.addEventListener('hashchange',()=>route());
++if(account&&location.hash)route();
++
++function dialog(titleText,body){
++  document.getElementById('catalog-dialog')?.remove();
++  const node=document.createElement('dialog');node.id='catalog-dialog';node.className='catalog-dialog';
++  node.innerHTML=`<div class="row between"><h2>${esc(titleText)}</h2><button id="dialog-close" aria-label="关闭对话框">×</button></div>${body}`;
++  document.body.appendChild(node);node.showModal();on('dialog-close','click',()=>node.remove());return node;
++}
++const initialDefinition=()=>({title:'',type:'number',required:true,options:[],validation:{integer:true,min_value:0,max_value:120}});
++function definitionFields(d){const v=d.validation||{};return `<label>题目标题<input id="lib-title" value="${esc(d.title)}" maxlength="300" required></label><div class="two"><label>题型<select id="lib-type">${Object.entries(typeNames).map(([k,n])=>`<option value="${k}" ${d.type===k?'selected':''}>${n}</option>`).join('')}</select></label><label class="check"><input id="lib-required" type="checkbox" ${d.required?'checked':''}>必答题</label></div><label>选项（选择题每行一个；填空题留空）<textarea id="lib-options">${esc(d.options.join('\n'))}</textarea></label><p class="hint">只填写当前题型对应的约束；不限制可留空。</p><div class="two">${[['min_choices','最少选项数'],['max_choices','最多选项数'],['min_length','最少字数'],['max_length','最多字数'],['min_value','最小数字'],['max_value','最大数字']].map(([k,n])=>`<label>${n}<input id="lib-${k}" type="number" step="any" value="${v[k]??''}"></label>`).join('')}</div><label class="check"><input id="lib-integer" type="checkbox" ${v.integer?'checked':''}>数字必须为整数</label><label>版本说明<textarea id="lib-note" maxlength="1000" placeholder="记录本次修改原因"></textarea></label><p id="lib-error" class="form-error"></p><button id="lib-submit" class="primary">保存为不可变版本</button>`}
++function readDefinition(){const validation={};for(const key of ['min_choices','max_choices','min_length','max_length','min_value','max_value']){const v=$('#lib-'+key).value;if(v!=='')validation[key]=Number(v)}validation.integer=$('#lib-integer').checked;return {title:$('#lib-title').value,type:$('#lib-type').value,required:$('#lib-required').checked,options:$('#lib-options').value.split('\n').map(x=>x.trim()).filter(Boolean),validation}}
++function definitionEditor(root=null,parent=null,fork=false){
++ const d=parent?structuredClone(parent.definition):initialDefinition();dialog(fork?'复制为我的题目':parent?`基于 v${parent.number} 创建新版本`:'新建常用题目',definitionFields(d));
++ on('lib-type','change',()=>{const t=$('#lib-type').value;$('#lib-options').value=['single','multiple'].includes(t)?'选项A\n选项B':'';document.querySelectorAll('[id^="lib-min"],[id^="lib-max"]').forEach(e=>e.value='');$('#lib-integer').checked=false});
++ on('lib-submit','click',async()=>{const b=$('#lib-submit');b.disabled=true;try{const body={definition:readDefinition(),note:$('#lib-note').value};let result;if(fork)result=await api('/library/versions/'+parent.id+'/fork','POST',body);else if(parent)result=await api('/library/questions/'+root.id+'/versions','POST',{...body,parent_version_id:parent.id});else result=await api('/library/questions','POST',body);$('#catalog-dialog').remove();toast('不可变版本已保存，已有问卷不会改变');await libraryDetail(root&&!fork?root.id:result.root.id)}catch(e){$('#lib-error').textContent=e.message;b.disabled=false}});
++}
++async function libraryPage(skip=0,scope='all'){
++ title('让好问题，被再次使用。');const rows=await api(`/library/questions?scope=${scope}&skip=${skip}&limit=24`);
++ $('#main').innerHTML=`<section class="card hero"><div><span class="eyebrow">QUESTION LIBRARY / IMMUTABLE HISTORY</span><h2>一个好问题，不止问一次。</h2><p>保存常用题，按版本复用。每次修改创建新版本，历史问卷保留原来的内容。</p><button class="primary" id="new-library">＋ 创建题目</button><button id="to-banks">管理题库</button></div></section><div class="row between"><h3>题目与版本</h3><select id="lib-scope" class="compact"><option value="all" ${scope==='all'?'selected':''}>全部可用</option><option value="owned" ${scope==='owned'?'selected':''}>我创建的</option><option value="shared" ${scope==='shared'?'selected':''}>共享给我的</option></select></div><div class="grid">${rows.map(r=>`<section class="card"><span class="badge">${r.is_owner?'我的题目':'共享题目'} · v${r.latest.number}</span><h3 class="survey-title">${esc(r.latest.definition.title)}</h3><p class="meta">${typeNames[r.latest.definition.type]} · ${date(r.latest.created_at)}</p><p class="hint">${esc(r.latest.note||'暂无版本说明')}</p><button data-root="${r.id}">版本、使用与统计 →</button></section>`).join('')||'<section class="card empty">没有可用题目。新建一个，或请其他用户按你的用户名共享。</section>'}</div><div class="row"><button id="lib-prev" ${skip===0?'disabled':''}>上一页</button><button id="lib-next" ${rows.length<24?'disabled':''}>下一页</button></div>`;
++ on('new-library','click',()=>definitionEditor());on('to-banks','click',()=>location.hash='banks');on('lib-scope','change',()=>guard(()=>libraryPage(0,$('#lib-scope').value)));on('lib-prev','click',()=>guard(()=>libraryPage(Math.max(0,skip-24),scope)));on('lib-next','click',()=>guard(()=>libraryPage(skip+24,scope)));document.querySelectorAll('[data-root]').forEach(b=>b.onclick=()=>guard(()=>libraryDetail(b.dataset.root)));
++}
++async function libraryDetail(rid){
++ const data=await api('/library/questions/'+rid);const root=data.root,versions=data.versions;title('每次演化，都有来处。');
++ $('#main').innerHTML=`<div class="row between"><div><span class="eyebrow">VERSION TIMELINE</span><h2>${esc(versions[0].definition.title)}</h2><p class="hint">题目ID ${esc(rid)} · ${data.is_owner?'你拥有此题目':'仅有取用权限；可复制为自己的题目'}</p></div><button id="lib-back">返回题目列表</button></div><div class="row"><button id="usage">查看被哪些问卷使用</button><button id="cross-stats" class="primary">跨问卷统计</button>${data.is_owner?'<button id="share-question">共享与权限</button>':''}</div><p class="hint">修改和恢复均生成新版本；已发布问卷、旧版本和已有回答保持原样。跳转规则属于具体问卷，不保存在可复用题目中。</p><div class="timeline">${versions.map(v=>`<section class="card"><div class="row between"><span class="badge">v${v.number}${v.restored_from_version_id?' · 恢复版本':''}</span><span class="meta">${date(v.created_at)}</span></div><h3>${esc(v.definition.title)}</h3><p>${typeNames[v.definition.type]} · ${v.definition.required?'必答':'选答'} · ${esc(limitHint({...v.definition,validation:v.definition.validation}))}</p>${v.definition.options.length?`<p>${v.definition.options.map(esc).join(' / ')}</p>`:''}<p class="hint">${esc(v.note||'无说明')}<br>来源 ${v.parent_version_id?`v${versions.find(x=>x.id===v.parent_version_id)?.number??'?'} (${esc(v.parent_version_id)})`:'初始版本'}</p><div class="actions">${data.is_owner?`<button data-edit-version="${v.id}">基于此版修改</button><button data-restore="${v.id}">恢复为新版本</button>`:`<button data-fork="${v.id}">复制为我的题</button>`}<button data-to-bank="${v.id}">加入题库</button></div></section>`).join('')}</div><div id="library-output"></div>`;
++ on('lib-back','click',()=>guard(()=>libraryPage()));on('usage','click',()=>guard(async()=>{const r=await api('/library/questions/'+rid+'/usage');$('#library-output').innerHTML=`<section class="card"><h3>使用此题的问卷 · ${r.surveys.length}份</h3><table class="summary-table"><tr><th>问卷</th><th>状态</th><th>题号 / 版本</th></tr>${r.surveys.map(s=>`<tr><td>${esc(s.title)}</td><td>${statusNames[s.status]}</td><td>${s.questions.map(q=>esc(q.question_id)+' / v'+(versions.find(v=>v.id===q.version_id)?.number??'?')).join('<br>')}</td></tr>`).join('')}</table><p class="hint">仅展示关联关系；其他用户的问卷标题与内容受保护。</p></section>`;$('#library-output').scrollIntoView({behavior:'smooth'})}));
++ on('cross-stats','click',()=>guard(()=>crossStats(rid,data.is_owner)));on('share-question','click',()=>guard(()=>shareDialog(rid)));
++ document.querySelectorAll('[data-edit-version]').forEach(b=>b.onclick=()=>definitionEditor(root,versions.find(v=>v.id===b.dataset.editVersion)));document.querySelectorAll('[data-fork]').forEach(b=>b.onclick=()=>definitionEditor(root,versions.find(v=>v.id===b.dataset.fork),true));
++ document.querySelectorAll('[data-restore]').forEach(b=>b.onclick=()=>guard(async()=>{await api('/library/questions/'+rid+'/versions/'+b.dataset.restore+'/restore','POST');toast('已生成恢复版本，旧版本保持不变');libraryDetail(rid)}));document.querySelectorAll('[data-to-bank]').forEach(b=>b.onclick=()=>guard(()=>chooseBank(b.dataset.toBank)));
++}
++async function shareDialog(rid){
++ const rows=await api('/library/questions/'+rid+'/shares');dialog('共享与权限',`<p class="hint">按用户名共享此题的全部版本（含未来新版本）。对方只能使用或复制，不能修改你的题目。题目所有者可查看跨卷聚合；其他作者原始填空内容不对你开放。</p><label>对方已注册的用户名<input id="share-user" maxlength="40"></label><button id="grant" class="primary">添加共享</button><div>${rows.map(r=>`<div class="row between share-row"><span>${esc(r.username)}</span><button data-revoke="${r.user_id}" class="danger">撤销共享</button></div>`).join('')||'<p class="muted">尚未共享</p>'}</div>`);
++ on('grant','click',()=>guard(async()=>{await api('/library/questions/'+rid+'/shares','POST',{username:$('#share-user').value});toast('共享成功');shareDialog(rid)}));document.querySelectorAll('[data-revoke]').forEach(b=>b.onclick=()=>guard(async()=>{await api('/library/questions/'+rid+'/shares/'+b.dataset.revoke,'DELETE');toast('已撤销新取用权限，已有快照仍有效');shareDialog(rid)}));
++}
++async function crossStats(rid,isOwner,scope='mine',skip=0){
++ const r=await api(`/library/questions/${rid}/stats?scope=${scope}&skip=${skip}&limit=100`);$('#library-output').innerHTML=`<section class="card"><div class="row between"><h3>跨问卷题目统计</h3><select id="cross-scope" class="compact"><option value="mine" ${scope==='mine'?'selected':''}>我创建的问卷</option>${isOwner?`<option value="all" ${scope==='all'?'selected':''}>所有引用此题的问卷（聚合）</option>`:''}</select></div><p class="hint">${esc(r.notice)}</p>${r.versions.map(v=>`<section class="version-stat"><span class="badge">v${v.number} · ${typeNames[v.definition.type]}</span><h3>${esc(v.definition.title)}</h3><p>${v.answered} 次作答 · 来自 ${v.survey_count} 份有回答的问卷</p>${v.options?v.options.map(o=>`<div class="bar-row"><span>${esc(o.label)}</span><div class="bar"><i style="width:${v.answered?100*o.count/v.answered:0}%"></i></div><strong>${o.count}</strong></div>`).join(''):`${v.definition.type==='number'?`<div class="stat-number">${v.average===null?'—':Number(v.average.toFixed(2))}</div><p>均值 · 最小 ${v.min??'—'} / 最大 ${v.max??'—'}</p>`:''}<p class="hint">原始内容仅来自自己的问卷，共 ${v.own_values_count} 条；当前显示第 ${skip+1} 条起。</p><div class="values">${v.values.map(esc).join('\n')||'当前范围暂无可展示内容'}</div>`}</section>`).join('')}<div class="row"><button id="cross-prev" ${skip===0?'disabled':''}>上一页内容</button><button id="cross-next" ${r.versions.every(v=>!v.own_values_count||skip+100>=v.own_values_count)?'disabled':''}>下一页内容</button></div></section>`;
++ on('cross-scope','change',()=>guard(()=>crossStats(rid,isOwner,$('#cross-scope').value,0)));on('cross-prev','click',()=>guard(()=>crossStats(rid,isOwner,scope,Math.max(0,skip-100))));on('cross-next','click',()=>guard(()=>crossStats(rid,isOwner,scope,skip+100)));$('#library-output').scrollIntoView({behavior:'smooth'});
++}
++async function chooseBank(vid){const banks=await api('/banks');dialog('加入题库',banks.length?`<label>选择题库<select id="target-bank">${banks.map(b=>`<option value="${b.id}">${esc(b.name)}</option>`).join('')}</select></label><p class="hint">同一逻辑题在每个题库中保留一个选定版本。选用新版不会改变已有问卷。</p><button id="bank-add-confirm" class="primary">加入 / 更新选定版本</button>`:'<p>还没有题库，请先在“我的题库”创建一个。</p>');on('bank-add-confirm','click',()=>guard(async()=>{await api('/banks/'+$('#target-bank').value+'/items','POST',{version_id:vid});$('#catalog-dialog').remove();toast('已加入题库')}))}
++async function banksPage(){title('把常用问题，整理成题库。');const rows=await api('/banks');$('#main').innerHTML=`<section class="card hero"><div><span class="eyebrow">PERSONAL QUESTION BANKS</span><h2>下一份问卷，从积累开始。</h2><p>把不同来源的题目整理到题库，选择确定版本，按需更新。</p><button id="new-bank" class="primary">＋ 创建题库</button><button id="bank-library">浏览题目</button></div></section><div class="grid">${rows.map(b=>`<section class="card"><h3>${esc(b.name)}</h3><p>${esc(b.description)}</p><p class="meta">${b.item_count} 道题</p><div class="actions"><button data-open-bank="${b.id}">查看与更新</button><button data-edit-bank="${b.id}">重命名</button><button class="danger" data-archive-bank="${b.id}">归档</button></div></section>`).join('')||'<section class="card empty">还没有题库，创建一个开始整理。</section>'}</div><div id="bank-output"></div>`;
++ on('new-bank','click',()=>bankEditor());on('bank-library','click',()=>location.hash='library');document.querySelectorAll('[data-open-bank]').forEach(b=>b.onclick=()=>guard(()=>bankDetail(b.dataset.openBank)));document.querySelectorAll('[data-edit-bank]').forEach(b=>b.onclick=()=>bankEditor(rows.find(x=>x.id===b.dataset.editBank)));document.querySelectorAll('[data-archive-bank]').forEach(b=>b.onclick=()=>guard(async()=>{if(!confirm('归档此题库？题目版本及已创建问卷仍会保留。'))return;await api('/banks/'+b.dataset.archiveBank,'DELETE');banksPage()}));
++}
++function bankEditor(bank=null){dialog(bank?'编辑题库':'新建题库',`<label>名称<input id="bank-name" maxlength="120" value="${esc(bank?.name||'')}"></label><label>说明<textarea id="bank-desc" maxlength="2000">${esc(bank?.description||'')}</textarea></label><button id="bank-save" class="primary">保存题库</button>`);on('bank-save','click',()=>guard(async()=>{const body={name:$('#bank-name').value,description:$('#bank-desc').value};await api(bank?'/banks/'+bank.id+'?revision='+bank.revision:'/banks',bank?'PUT':'POST',body);$('#catalog-dialog').remove();banksPage()}))}
++async function bankDetail(bid){const items=await api('/banks/'+bid+'/items');$('#bank-output').innerHTML=`<section class="card"><h3>题库中的选定版本</h3><p class="hint">到题目版本页“加入题库”可添加；发现新版本后需手动选择更新，不会自动改动旧问卷。</p>${items.map(i=>`<div class="bank-item"><div><strong>${i.available?esc(i.version.definition.title):'共享题目不可再取用'}</strong><p class="hint">${i.available?'v'+i.version.number+(i.has_update?' · 有新版本可用':' · 当前已是最新版本'):esc(i.message)}</p></div><div class="row">${i.available?`<button data-bank-version="${i.root_id}">版本详情</button>${i.has_update?`<button data-update-bank="${i.latest_version_id}">采用最新版本</button>`:''}`:''}<button data-remove-bank-item="${i.root_id}" class="danger">移出</button></div></div>`).join('')||'<p>题库暂无题目。</p>'}</section>`;document.querySelectorAll('[data-bank-version]').forEach(b=>b.onclick=()=>guard(()=>libraryDetail(b.dataset.bankVersion)));document.querySelectorAll('[data-update-bank]').forEach(b=>b.onclick=()=>guard(async()=>{await api('/banks/'+bid+'/items','POST',{version_id:b.dataset.updateBank});bankDetail(bid)}));document.querySelectorAll('[data-remove-bank-item]').forEach(b=>b.onclick=()=>guard(async()=>{await api('/banks/'+bid+'/items/'+b.dataset.removeBankItem,'DELETE');bankDetail(bid)}));$('#bank-output').scrollIntoView({behavior:'smooth'})}
++
++const stageOneDrawEditor=drawEditor;
++drawEditor=function(){
++ stageOneDrawEditor();const add=$('#add-q');if(!add)return;
++ add.insertAdjacentHTML('afterend',' <button id="pick-library" class="primary">从题库 / 常用题选题</button>');on('pick-library','click',()=>guard(pickLibrary));
++ document.querySelectorAll('.question-card[data-q]').forEach(el=>{const i=+el.dataset.q,q=draft.questions[i];el.querySelector('.qhead').insertAdjacentHTML('afterend',`<div class="row source-row">${q.source?`<span class="badge">已绑定题目版本 · ${esc(q.source.version_id.slice(-6))}</span><button class="small-btn" data-detach="${i}">解除引用，另存为本地题</button>`:`<button class="small-btn" data-save-library="${i}">保存此题到常用题</button>`}</div>`);if(q.source){el.querySelectorAll('.qtitle,[data-type],.required,.options,[data-limit],.integer').forEach(x=>x.disabled=true)}});
++ document.querySelectorAll('[data-detach]').forEach(b=>b.onclick=()=>{readEditor();draft.questions[+b.dataset.detach].source=null;drawEditor();toast('已解除来源引用，可以编辑；此本地题不参与原题跨问卷统计')});
++ document.querySelectorAll('[data-save-library]').forEach(b=>b.onclick=()=>guard(async()=>{const index=+b.dataset.saveLibrary;await saveDraft();await api('/surveys/'+draft.id+'/questions/'+draft.questions[index].id+'/save-to-library','POST');toast('已保存常用题副本，可从题库选题；原问卷不自动关联');drawEditor()}));
++};
++async function pickLibrary(){
++ readEditor();const [roots,banks]=await Promise.all([api('/library/questions?limit=100'),api('/banks')]);
++ dialog('从常用题 / 题库选题',`<label>题目范围<select id="picker-bank"><option value="">全部可用常用题（最近100道）</option>${banks.map(b=>`<option value="${b.id}">${esc(b.name)}</option>`).join('')}</select></label><div id="picker-list"></div><p class="hint">选择版本后会先保存当前草稿，再导入题目快照；跳转规则在问卷内单独配置。</p>`);
++ async function renderItems(){const bid=$('#picker-bank').value;const list=bid?(await api('/banks/'+bid+'/items')).filter(i=>i.available).map(i=>({id:i.root_id,latest:i.version})):roots;$('#picker-list').innerHTML=list.map(r=>`<div class="bank-item"><div><strong>${esc(r.latest.definition.title)}</strong><p class="hint">${typeNames[r.latest.definition.type]} · 选定v${r.latest.number}</p></div><button data-pick-root="${r.id}" data-pinned="${r.latest.id}">选择版本</button></div>`).join('')||'<p>暂无可用题目。可先去“题目与版本”创建。</p>';document.querySelectorAll('[data-pick-root]').forEach(b=>b.onclick=()=>guard(async()=>{const data=await api('/library/questions/'+b.dataset.pickRoot);$('#picker-list').innerHTML=`<label>确切版本<select id="picker-version">${data.versions.map(v=>`<option value="${v.id}" ${v.id===b.dataset.pinned?'selected':''}>v${v.number} · ${esc(v.definition.title)}</option>`).join('')}</select></label><label>问卷内题号<input id="picker-local" value="${qnew().id}" maxlength="40"></label><button id="picker-import" class="primary">导入此版本</button>`;on('picker-import','click',()=>guard(async()=>{const version_id=$('#picker-version').value,local_id=$('#picker-local').value;await saveDraft();draft=await api('/surveys/'+draft.id+'/import-question?revision='+draft.revision,'POST',{version_id,local_id});$('#catalog-dialog').remove();drawEditor();toast('版本快照已导入')}))}));}
++ on('picker-bank','change',()=>guard(renderItems));await renderItems();
++}
+--- stage1/app/static/index.html
++++ stage2/app/static/index.html
+@@ -1,9 +1,10 @@
+ <!doctype html>
+ <html lang="zh-CN">
+-<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>问序 · SurveyFlow</title><link rel="stylesheet" href="/static/style.css"><script src="/static/app.js" defer></script></head>
++<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>问序 · SurveyFlow</title><link rel="stylesheet" href="/static/style.css"><script src="/static/app.js" defer></script><script src="/static/catalog.js" defer></script></head>
+ <body>
+-<aside class="sidebar"><a class="brand" href="/">问<span>序</span><small>SURVEYFLOW</small></a><div class="tag">MongoDB 问卷工作台</div><nav><a href="/" class="nav-active">▦　我的问卷</a></nav><div class="side-bottom"><span class="dot"></span> 第一阶段 · 1.0<br><small>设计问题，也设计路径。</small></div></aside>
+-<div class="workspace"><header><div><span class="eyebrow">WORKSPACE / STAGE ONE</span><h1 id="page-title">让每一次提问，都有方向。</h1></div><div id="account"></div></header>
++<aside class="sidebar"><a class="brand" href="/">问<span>序</span><small>SURVEYFLOW</small></a><div class="tag">MongoDB 问卷工作台</div><nav><a href="/" class="nav-active">▦　我的问卷</a><a href="/#library">◇　题目与版本</a><a href="/#banks">▤　我的题库</a></nav><div class="side-bottom"><span class="dot"></span> 第二阶段 · 2.0<br><small>复用问题，保留每次演化。</small></div></aside>
++<div class="workspace"><header><div><span class="eyebrow">WORKSPACE / STAGE TWO</span><h1 id="page-title">让每一次提问，都有方向。</h1></div><div id="account"></div></header>
++<nav class="mobile-nav"><a href="/">我的问卷</a><a href="/#library">题目与版本</a><a href="/#banks">我的题库</a></nav>
+ <main id="main"><p>正在连接工作台…</p></main><footer>问序 SurveyFlow <span>FastAPI × MongoDB　·　可解释的问卷路径</span></footer></div>
+ <div id="toast" role="status" aria-live="polite"></div>
+ </body></html>
+--- stage1/app/static/style.css
++++ stage2/app/static/style.css
+@@ -1 +1,2 @@
+ :root{--ink:#183b35;--muted:#697c76;--green:#1c6b57;--line:#dce5df;--paper:#f6f8f4;--gold:#dba95b}*{box-sizing:border-box}body{margin:0;background:var(--paper);color:var(--ink);font:15px/1.65 "Microsoft YaHei",system-ui,sans-serif}button,input,textarea,select{font:inherit}button,a{touch-action:manipulation}a{color:var(--green);text-decoration:none}button{border:1px solid var(--line);background:white;border-radius:9px;padding:9px 17px;cursor:pointer;color:var(--ink)}button:hover{border-color:var(--green);background:#f0f6f2}button:disabled{opacity:.55;cursor:wait}.primary{background:var(--green);border-color:var(--green);color:white}.primary:hover{background:#125242;color:white}.danger{color:#a33b38}.sidebar{position:fixed;width:224px;inset:0 auto 0 0;background:#113f36;color:#e8f1e9;padding:40px 27px}.brand{font-size:35px;font-weight:800;color:white;letter-spacing:5px}.brand span{color:#c5d9a4}.brand small{display:block;font-size:10px;letter-spacing:3px;font-weight:400}.tag{margin-top:25px;color:#a8c5ba;font-size:12px}.sidebar nav{margin-top:55px}.sidebar nav a{display:block;color:white;padding:12px;border-radius:8px;background:#28564b;font-size:14px}.side-bottom{position:absolute;bottom:35px;font-size:12px;color:#bbd0c6}.side-bottom small{display:block;margin-top:10px;color:#91b3a4}.dot{display:inline-block;width:7px;height:7px;border-radius:50%;background:#b7d995;margin-right:5px}.workspace{margin-left:224px;max-width:1700px;padding:35px 5vw 15px}header{display:flex;justify-content:space-between;align-items:center;gap:20px;margin-bottom:35px}.eyebrow{font-size:10px;color:var(--muted);letter-spacing:2px}h1{font-size:28px;letter-spacing:-1px;line-height:1.4;margin:8px 0}h2{font-size:23px;margin:0 0 16px}h3{font-size:17px;margin:0 0 10px}p{margin:8px 0 16px}.muted,small{color:var(--muted)}.row{display:flex;gap:12px;align-items:center;flex-wrap:wrap}.between{justify-content:space-between}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:20px}.card{border:1px solid var(--line);background:#fff;border-radius:16px;padding:25px;margin-bottom:20px;box-shadow:0 5px 20px #173c3404}.card p{color:var(--muted)}.hero{background:#e6eddf;border:0;position:relative;overflow:hidden;padding:30px}.hero:after{content:'↗';position:absolute;right:28px;top:-20px;font-size:145px;line-height:1.5;color:#c5d5b8;pointer-events:none}.hero>div{position:relative;z-index:1}.hero p{max-width:600px}.badge{display:inline-block;border-radius:5px;padding:3px 9px;font-size:11px;letter-spacing:1px;background:#edf3e9;color:#447147}.badge.published{background:#dff1e9;color:#166049}.badge.closed{background:#f1e9e7;color:#88615a}.meta{font-size:12px;color:var(--muted)}.survey-title{font-size:20px;margin:15px 0 8px}.actions{margin-top:20px;display:flex;gap:8px;flex-wrap:wrap}.actions button{padding:6px 12px;font-size:13px}label{display:block;font-size:13px;margin:13px 0 5px;font-weight:500}input,textarea,select{width:100%;border:1px solid #cddbd2;border-radius:8px;background:#fff;padding:10px;color:var(--ink)}textarea{resize:vertical;min-height:90px}input:focus,textarea:focus,select:focus{outline:2px solid #8cb4a2;outline-offset:1px}input[type=checkbox],input[type=radio]{width:auto;accent-color:var(--green)}.check{display:flex;align-items:center;gap:9px;font-size:14px}.two{display:grid;grid-template-columns:1fr 1fr;gap:18px}.auth{max-width:500px;margin:45px auto}.auth .eyebrow{color:var(--green)}.auth p{font-size:13px}.form-error{color:#ab3f37;font-size:13px;white-space:pre-wrap}.qhead{display:flex;align-items:center;gap:12px}.qhead .qnum{background:#e7efe6;width:34px;height:34px;text-align:center;padding-top:4px;border-radius:8px;font-weight:700}.question-card{border-left:3px solid #8aab8e}.question-card .tools{margin-left:auto}.tools button{padding:3px 9px}.rule{display:grid;grid-template-columns:130px 1fr 150px 40px;gap:8px;margin-top:10px}.rule input,.rule select{padding:7px;font-size:13px}.rule-section{border-top:1px solid var(--line);margin-top:20px;padding-top:15px}.hint{font-size:12px;color:var(--muted);margin:8px 0}.sticky-actions{position:sticky;bottom:12px;background:#fffffff2;backdrop-filter:blur(8px);border:1px solid var(--line);padding:15px;border-radius:12px;box-shadow:0 5px 25px #183b3512;z-index:2}.success-box{background:#edf5e6;border:1px solid #cfdfc0;padding:18px;border-radius:10px}.error-box{background:#fff1ee;border:1px solid #edc9be;padding:18px;border-radius:10px}.warning{color:#966319}.fill{max-width:760px;margin:auto}.fill .card{padding:35px}.progress{height:5px;background:#e2e9e0;border-radius:5px;margin:22px 0}.progress span{display:block;height:100%;background:#71956e;border-radius:5px}.option{display:flex;gap:12px;align-items:center;border:1px solid var(--line);padding:15px;border-radius:10px;cursor:pointer;font-size:15px}.option:has(input:checked){background:#edf5e9;border-color:#75a185}.question-text{font-size:23px;margin:20px 0}.stat-number{font-size:42px;font-weight:700;line-height:1.3}.bar-row{display:grid;grid-template-columns:110px 1fr 45px;gap:12px;align-items:center;margin:12px 0}.bar{height:10px;background:#eef2eb;border-radius:10px;overflow:hidden}.bar i{display:block;height:100%;background:#7e9e73}.values{max-height:260px;overflow:auto;background:#f8faf6;padding:15px;white-space:pre-wrap;overflow-wrap:anywhere}.trace{padding:12px 15px;border-radius:8px;background:#f1f5ec;font-size:13px;margin:18px 0}#toast{position:fixed;bottom:28px;right:30px;max-width:450px;padding:15px 22px;background:#153f35;color:white;border-radius:10px;box-shadow:0 4px 25px #0002;z-index:20;display:none;white-space:pre-wrap}footer{border-top:1px solid var(--line);margin-top:45px;padding-top:15px;font-size:11px;color:var(--muted);display:flex;justify-content:space-between}.empty{text-align:center;padding:55px 20px}.small-btn{font-size:12px;padding:5px 10px}.page-link{word-break:break-all}.summary-table{width:100%;border-collapse:collapse;font-size:13px}.summary-table td,.summary-table th{text-align:left;padding:10px;border-bottom:1px solid var(--line);vertical-align:top}.summary-table td{overflow-wrap:anywhere}pre{overflow:auto}.login-row{margin-top:15px;display:flex;justify-content:space-between;gap:12px}@media(max-width:850px){.sidebar{display:none}.workspace{margin:0;padding:20px}header{align-items:flex-start}h1{font-size:23px}.two{grid-template-columns:1fr}.rule{grid-template-columns:1fr 1fr}.hero:after{display:none}.fill .card{padding:22px}.bar-row{grid-template-columns:80px 1fr 35px}footer span{display:none}.grid{grid-template-columns:1fr}.workspace header #account{font-size:12px}}@media(prefers-reduced-motion:no-preference){.card{animation:appear .3s ease-out}@keyframes appear{from{opacity:0;transform:translateY(5px)}to{opacity:1;transform:translateY(0)}}}
++:root{scroll-behavior:smooth}.sidebar nav a{margin-bottom:10px}.compact{width:auto;max-width:360px}.mobile-nav{display:none}.catalog-dialog{border:1px solid var(--line);border-radius:16px;color:var(--ink);width:min(740px,94vw);max-height:88vh;padding:28px;background:white}.catalog-dialog::backdrop{background:#153b3566;backdrop-filter:blur(2px)}.source-row{margin:14px 0}.source-row .badge{background:#ece8fa;color:#67548b}.bank-item,.share-row{display:flex;justify-content:space-between;align-items:center;gap:15px;border-bottom:1px solid var(--line);padding:16px 0}.version-stat{border-top:1px solid var(--line);padding:24px 0}.timeline{margin-top:25px}.timeline .card{border-left:3px solid #8fa77c}.question-card input:disabled,.question-card textarea:disabled,.question-card select:disabled{background:#f2f4ef;color:#637269;opacity:1}.question-card .qid{min-width:70px;max-width:180px}@media(max-width:850px){.mobile-nav{display:flex;gap:18px;margin-bottom:25px;font-size:13px}.bank-item{flex-wrap:wrap}.catalog-dialog{padding:20px}}
+--- stage1/tests/test_stage2.py
++++ stage2/tests/test_stage2.py
+@@ -0,0 +1,315 @@
++"""Actual MongoDB integration tests for incremental stage-two behavior."""
++import os,uuid,copy
++from concurrent.futures import ThreadPoolExecutor
++from datetime import datetime,timezone
++from bson import ObjectId
++from pymongo import MongoClient
++from pymongo.errors import WriteError
++from fastapi.testclient import TestClient
++import pytest
++from app.main import app
++from app.database import initialize
++
++@pytest.fixture(scope='module')
++def clients():
++    name='dm_project1_stage2_test_'+uuid.uuid4().hex
++    old=os.environ.get('MONGODB_DB');os.environ['MONGODB_DB']=name
++    a=TestClient(app);b=TestClient(app);outsider=TestClient(app)
++    try:
++        with a:
++            for client in [a,b,outsider]:
++                body={'username':'u_'+uuid.uuid4().hex[:15],'password':'StageTwoTest123!'}
++                assert client.post('/api/auth/register',json=body).status_code==201
++                assert client.post('/api/auth/login',json=body).status_code==200
++            yield a,b,outsider
++    finally:
++        c=MongoClient(os.getenv('MONGODB_URI','mongodb://127.0.0.1:27017/'),serverSelectionTimeoutMS=3000)
++        assert name.startswith('dm_project1_stage2_test_') and len(name)==56
++        c.drop_database(name);c.close();b.close();outsider.close()
++        if old is None:os.environ.pop('MONGODB_DB',None)
++        else:os.environ['MONGODB_DB']=old
++
++def definition(kind='number',**changes):
++    return {'title':'年龄','type':kind,'required':True,'options':['A','B','C'] if kind in ('single','multiple') else [],'validation':{'integer':True,'min_value':0,'max_value':120} if kind=='number' else {},**changes}
++
++def create(a,d=None):
++    r=a.post('/api/library/questions',json={'definition':d or definition(),'note':'初始版本'})
++    assert r.status_code==201,r.text
++    return r.json()
++
++def version(a,root,parent,d=None):
++    r=a.post('/api/library/questions/'+root+'/versions',json={'parent_version_id':parent,'definition':d or definition(title='年龄（新版本）'),'note':'更新'})
++    assert r.status_code==201,r.text
++    return r.json()
++
++def survey(a,vid,local='age',multiple=True):
++    s=a.post('/api/surveys',json={'title':'复用调查','allow_multiple':multiple}).json()
++    r=a.post('/api/surveys/'+s['id']+'/import-question?revision=1',json={'version_id':vid,'local_id':local})
++    assert r.status_code==201,r.text
++    s=r.json();assert a.post('/api/surveys/'+s['id']+'/publish').status_code==200
++    return s
++
++def submit(a,sid,value,key='age'):
++    r=a.post('/api/public/surveys/'+sid+'/responses',json={'answers':{key:value},'anonymous':True,'request_id':uuid.uuid4().hex})
++    assert r.status_code==201,r.text
++    return r.json()
++
++def share(a,b,rid):
++    username=b.get('/api/auth/me').json()['username']
++    r=a.post('/api/library/questions/'+rid+'/shares',json={'username':username})
++    assert r.status_code==201,r.text
++
++def payload(s):return {k:s[k] for k in ['title','description','allow_anonymous','allow_multiple','deadline','questions']}
++
++def test_create_read_immutable_versions(clients):
++    a,b,c=clients;x=create(a);rid=x['root']['id'];v=x['version']
++    assert v['number']==1 and v['parent_version_id'] is None and len(v['fingerprint'])==64
++    assert b.get('/api/library/questions/'+rid).status_code==404
++    assert a.patch('/api/library/questions/'+rid+'/versions/'+v['id'],json={'title':'篡改'}).status_code==404
++    assert a.get('/api/library/questions/'+rid).json()['versions'][0]==v
++
++def test_versions_branch_restore_and_coexist(clients):
++    a,_,_=clients;x=create(a);rid=x['root']['id'];v1=x['version']
++    v2=version(a,rid,v1['id']);v3=version(a,rid,v1['id'],definition(title='另一分支'))
++    assert [v2['number'],v3['number']]==[2,3]
++    assert v2['parent_version_id']==v3['parent_version_id']==v1['id']
++    restored=a.post(f'/api/library/questions/{rid}/versions/{v1["id"]}/restore').json()
++    assert restored['number']==4 and restored['restored_from_version_id']==v1['id']
++    assert restored['definition']==v1['definition'] and restored['fingerprint']==v1['fingerprint']
++    assert len(a.get('/api/library/questions/'+rid).json()['versions'])==4
++
++def test_published_snapshot_never_changes(clients):
++    a,_,_=clients;x=create(a);rid=x['root']['id'];v1=x['version'];s=survey(a,v1['id']);submit(a,s['id'],18)
++    before=a.get('/api/surveys/'+s['id']).json()
++    v2=version(a,rid,v1['id'],definition(title='年龄（岁）',validation={'max_value':60,'integer':True}))
++    after=a.get('/api/surveys/'+s['id']).json()
++    assert before==after and after['questions'][0]['source']['version_id']==v1['id']
++    s2=survey(a,v2['id']);assert s2['questions'][0]['title']=='年龄（岁）'
++    assert a.get('/api/surveys/'+s['id']+'/stats').json()['questions'][0]['average']==18
++
++def test_sharing_use_not_edit_and_revoke(clients):
++    a,b,c=clients;x=create(a);rid=x['root']['id'];v=x['version'];share(a,b,rid)
++    assert b.get('/api/library/questions/'+rid).status_code==200
++    assert rid in [r['id'] for r in b.get('/api/library/questions?scope=shared').json()]
++    assert rid in [r['id'] for r in a.get('/api/library/questions?scope=owned').json()]
++    assert c.get('/api/library/questions/'+rid).status_code==404
++    assert b.post('/api/library/questions/'+rid+'/versions',json={'definition':definition(),'parent_version_id':v['id']}).status_code==404
++    s=survey(b,v['id']);uid=b.get('/api/auth/me').json()['id']
++    assert a.delete('/api/library/questions/'+rid+'/shares/'+uid).status_code==200
++    assert b.get('/api/library/questions/'+rid).status_code==404
++    assert b.post('/api/surveys',json={'title':'伪造','questions':s['questions']}).status_code==404
++    submit(b,s['id'],22)
++    assert b.get('/api/surveys/'+s['id']+'/stats').json()['total_responses']==1
++
++def test_revoked_existing_draft_can_save_but_not_duplicate_source(clients):
++    a,b,_=clients;x=create(a);rid=x['root']['id'];share(a,b,rid)
++    s=b.post('/api/surveys',json={'title':'草稿'}).json()
++    s=b.post('/api/surveys/'+s['id']+'/import-question?revision=1',json={'version_id':x['version']['id'],'local_id':'age'}).json()
++    uid=b.get('/api/auth/me').json()['id'];a.delete('/api/library/questions/'+rid+'/shares/'+uid)
++    body=payload(s);body['description']='仍能编辑说明'
++    r=b.put('/api/surveys/'+s['id']+'?revision=2',json=body);assert r.status_code==200
++    body['questions'].append({**body['questions'][0],'id':'age2'})
++    assert b.put('/api/surveys/'+s['id']+'?revision=3',json=body).status_code==404
++
++def test_forged_source_and_changed_content_rejected(clients):
++    a,_,_=clients;x=create(a);s=a.post('/api/surveys',json={'title':'draft'}).json()
++    s=a.post('/api/surveys/'+s['id']+'/import-question?revision=1',json={'version_id':x['version']['id'],'local_id':'age'}).json()
++    body=payload(s);body['questions'][0]['title']='改坏'
++    assert a.put('/api/surveys/'+s['id']+'?revision=2',json=body).status_code==422
++    body=payload(s);body['questions'][0]['source']['fingerprint']='0'*64
++    assert a.post('/api/surveys',json=body).status_code==422
++    body=payload(s);body['questions'][0]['source']['version_id']=str(ObjectId())
++    assert a.post('/api/surveys',json=body).status_code==422
++
++def test_detach_to_local_question_is_allowed(clients):
++    a,_,_=clients;x=create(a);s=a.post('/api/surveys',json={'title':'draft'}).json()
++    s=a.post('/api/surveys/'+s['id']+'/import-question?revision=1',json={'version_id':x['version']['id'],'local_id':'age'}).json()
++    body=payload(s);body['questions'][0].update(source=None,title='自己改为本地题')
++    assert a.put('/api/surveys/'+s['id']+'?revision=2',json=body).status_code==200
++    assert not a.get('/api/library/questions/'+x['root']['id']+'/usage').json()['surveys']
++
++def test_import_guards_and_contextual_rules(clients):
++    a,_,_=clients;x=create(a);s=a.post('/api/surveys',json={'title':'draft'}).json()
++    r=a.post('/api/surveys/'+s['id']+'/import-question?revision=1',json={'version_id':x['version']['id'],'local_id':'age'})
++    assert r.status_code==201;r=r.json();assert r['schema_version']==2
++    assert a.post('/api/surveys/'+s['id']+'/import-question?revision=2',json={'version_id':x['version']['id'],'local_id':'age'}).status_code==409
++    body=payload(r);body['questions'][0]['rules']=[{'op':'gte','value':18,'target':'END'}]
++    assert a.put('/api/surveys/'+s['id']+'?revision=2',json=body).status_code==200
++    assert a.post('/api/surveys/'+s['id']+'/publish').status_code==200
++    assert a.post('/api/surveys/'+s['id']+'/import-question?revision=3',json={'version_id':x['version']['id'],'local_id':'x'}).status_code==409
++
++def test_usage_redaction_and_scope(clients):
++    a,b,_=clients;x=create(a);share(a,b,x['root']['id']);survey(a,x['version']['id']);sb=survey(b,x['version']['id'])
++    rows=a.get('/api/library/questions/'+x['root']['id']+'/usage').json()['surveys']
++    assert len(rows)==2
++    assert next(r for r in rows if r['survey_id']==sb['id'])['title']=='其他用户问卷（内容受保护）'
++    assert len(b.get('/api/library/questions/'+x['root']['id']+'/usage').json()['surveys'])==1
++
++@pytest.mark.parametrize('kind,values,expected',[('number',[20,40],30),('single',['A','B'],None),('multiple',[['A','B'],['B']],None),('text',['建议一','建议二'],None)])
++def test_cross_survey_stats_each_type(clients,kind,values,expected):
++    a,_,_=clients;x=create(a,definition(kind));rid=x['root']['id'];v=x['version']
++    for i,value in enumerate(values):
++        s=survey(a,v['id'],local='local'+str(i));submit(a,s['id'],value,key='local'+str(i))
++    r=a.get('/api/library/questions/'+rid+'/stats?limit=1').json()['versions'][0]
++    assert r['answered']==2 and r['survey_count']==2
++    if kind=='number':assert r['average']==expected and len(r['values'])==1
++    if kind=='text':assert len(r['values'])==1
++    if kind=='single':assert [o['count'] for o in r['options']]==[1,1,0]
++    if kind=='multiple':assert [o['count'] for o in r['options']]==[1,2,0]
++
++def test_stats_all_versions_separate_and_empty(clients):
++    a,_,_=clients;x=create(a);v2=version(a,x['root']['id'],x['version']['id'])
++    s=survey(a,x['version']['id']);submit(a,s['id'],18)
++    r=a.get('/api/library/questions/'+x['root']['id']+'/stats').json()
++    assert len(r['versions'])==2 and r['grouping']=='exact_version'
++    assert r['versions'][1]['answered']==0 and r['versions'][1]['average'] is None
++    assert a.get('/api/library/questions/'+x['root']['id']+'/stats?version_id='+str(ObjectId())).status_code==404
++
++def test_global_aggregate_and_raw_content_privacy(clients):
++    a,b,_=clients;x=create(a);rid=x['root']['id'];vid=x['version']['id'];share(a,b,rid)
++    sa=survey(a,vid);sb=survey(b,vid);submit(a,sa['id'],20);submit(b,sb['id'],40)
++    mine=a.get('/api/library/questions/'+rid+'/stats').json()['versions'][0];assert mine['average']==20
++    allrows=a.get('/api/library/questions/'+rid+'/stats?scope=all').json()['versions'][0]
++    assert allrows['average']==30 and allrows['answered']==2 and allrows['values']==[20]
++    assert b.get('/api/library/questions/'+rid+'/stats?scope=all').status_code==403
++    t=create(a,definition('text'));share(a,b,t['root']['id']);s=survey(b,t['version']['id']);submit(b,s['id'],'其他问卷私密文本')
++    r=a.get('/api/library/questions/'+t['root']['id']+'/stats?scope=all').json()['versions'][0]
++    assert r['answered']==1 and r['values']==[]
++
++def test_banks_add_update_remove_archive(clients):
++    a,b,_=clients;x=create(a);rid=x['root']['id'];v=x['version'];bank=a.post('/api/banks',json={'name':'常用题','description':'测试'}).json();bid=bank['id']
++    assert b.get('/api/banks/'+bid+'/items').status_code==404
++    assert a.post('/api/banks/'+bid+'/items',json={'version_id':v['id']}).status_code==201
++    assert a.get('/api/banks').json()[0]['item_count']==1
++    v2=version(a,rid,v['id']);item=a.get('/api/banks/'+bid+'/items').json()[0];assert item['has_update'] and item['version']['id']==v['id']
++    assert a.post('/api/banks/'+bid+'/items',json={'version_id':v2['id']}).status_code==201
++    assert not a.get('/api/banks/'+bid+'/items').json()[0]['has_update']
++    assert a.put('/api/banks/'+bid+'?revision=1',json={'name':'新名称'}).status_code==200
++    assert a.put('/api/banks/'+bid+'?revision=1',json={'name':'冲突'}).status_code==409
++    assert a.delete('/api/banks/'+bid+'/items/'+rid).status_code==200
++    assert a.get('/api/banks/'+bid+'/items').json()==[]
++    assert a.delete('/api/banks/'+bid).status_code==200
++    assert a.get('/api/banks/'+bid+'/items').status_code==404
++    assert a.get('/api/library/questions/'+rid).status_code==200
++
++def test_bank_shared_revoke_unavailable(clients):
++    a,b,_=clients;x=create(a);rid=x['root']['id'];share(a,b,rid)
++    bank=b.post('/api/banks',json={'name':'共享收藏'}).json();b.post('/api/banks/'+bank['id']+'/items',json={'version_id':x['version']['id']})
++    a.delete('/api/library/questions/'+rid+'/shares/'+b.get('/api/auth/me').json()['id'])
++    assert b.get('/api/banks/'+bank['id']+'/items').json()[0]['available'] is False
++
++def test_fork_shared_question_independent_owner(clients):
++    a,b,_=clients;x=create(a);share(a,b,x['root']['id'])
++    f=b.post('/api/library/versions/'+x['version']['id']+'/fork',json={'definition':definition(title='我的改编')})
++    assert f.status_code==201;f=f.json()
++    assert f['root']['derived_from_version_id']==x['version']['id']
++    assert b.get('/api/library/questions/'+f['root']['id']).json()['is_owner']
++    assert a.get('/api/library/questions/'+x['root']['id']).json()['versions'][0]['definition']['title']=='年龄'
++
++def test_save_existing_does_not_relink_history(clients):
++    a,_,_=clients;x=create(a);s=survey(a,x['version']['id']);before=a.get('/api/surveys/'+s['id']).json()
++    r=a.post('/api/surveys/'+s['id']+'/questions/age/save-to-library')
++    assert r.status_code==201
++    assert a.get('/api/surveys/'+s['id']).json()==before
++
++def test_concurrent_new_versions_unique_numbers(clients):
++    a,_,_=clients;x=create(a);rid=x['root']['id'];parent=x['version']['id']
++    with ThreadPoolExecutor(max_workers=6) as pool:rows=list(pool.map(lambda _:version(a,rid,parent),range(6)))
++    assert sorted(r['number'] for r in rows)==list(range(2,8))
++    assert len({r['id'] for r in rows})==6
++
++def test_wrong_parent_unknown_recipient_invalid_definition(clients):
++    a,_,_=clients;x=create(a);y=create(a)
++    r=a.post('/api/library/questions/'+x['root']['id']+'/versions',json={'definition':definition(),'parent_version_id':y['version']['id']})
++    assert r.status_code==404
++    assert a.post('/api/library/questions/'+x['root']['id']+'/shares',json={'username':'nonexistent_'+uuid.uuid4().hex[:10]}).status_code==404
++    assert a.post('/api/library/questions',json={'definition':definition('single',options=['A','A'])}).status_code==422
++    assert a.post('/api/banks',json={'name':'   '}).status_code==422
++
++def test_additive_migration_legacy_docs_unchanged(clients):
++    a,_,_=clients;database=app.state.db
++    # Construct an actual v1 document without source fields, including existing responses.
++    s=a.post('/api/surveys',json={'title':'旧问卷','questions':[{'id':'n','title':'旧年龄','type':'number'}]}).json()
++    sid=ObjectId(s['id']);database.surveys.update_one({'_id':sid},{'$set':{'schema_version':1},'$unset':{'questions.0.source':''}})
++    a.post('/api/surveys/'+s['id']+'/publish');submit(a,s['id'],25,key='n')
++    before=database.surveys.find_one({'_id':sid});responses=list(database.responses.find({'survey_id':sid}))
++    initialize(database);initialize(database)
++    assert database.surveys.find_one({'_id':sid})==before
++    assert list(database.responses.find({'survey_id':sid}))==responses
++    assert a.get('/api/surveys/'+s['id']+'/stats').json()['questions'][0]['average']==25
++    assert database.migrations.count_documents({'_id':'stage2_catalog_v1'})==1
++
++def test_catalog_db_validators_and_indexes(clients):
++    database=app.state.db
++    for name in ['question_roots','question_versions','question_shares','question_banks','bank_items']:
++        assert name in database.list_collection_names()
++    assert database.question_versions.index_information()['uq_root_version']['unique']
++    assert database.bank_items.index_information()['uq_bank_root']['unique']
++    with pytest.raises(WriteError):database.question_versions.insert_one({'definition':[]})
++
++def test_library_auth_and_assets(clients):
++    a,_,_=clients
++    anon=TestClient(app)
++    for url in ['/api/library/questions','/api/banks']:
++        assert anon.get(url).status_code==401
++    assert a.get('/static/catalog.js').status_code==200
++    assert a.get('/api/health').json()['schema_version']==2
++    anon.close()
++
++def test_backup_bson_and_manifest(clients,tmp_path):
++    from scripts.upgrade import backup
++    from bson import decode_all
++    import hashlib,json
++    database=app.state.db;target=tmp_path/'private_backup'
++    result=backup(database,target)
++    saved=json.loads((target/'manifest.json').read_text(encoding='utf-8'))
++    assert saved['database']==database.name
++    for name,info in result['collections'].items():
++        raw=(target/(name+'.bson')).read_bytes()
++        assert hashlib.sha256(raw).hexdigest()==info['sha256']
++        assert len(decode_all(raw))==info['count']==database[name].count_documents({})
++    with pytest.raises(FileExistsError):backup(database,target)
++
++def test_optional_unanswered_not_counted(clients):
++    a,_,_=clients;x=create(a,definition(required=False));s=survey(a,x['version']['id'])
++    submit(a,s['id'],None)
++    q=a.get('/api/library/questions/'+x['root']['id']+'/stats').json()['versions'][0]
++    assert q['answered']==0 and q['average'] is None
++
++def test_concurrent_grants_idempotent(clients):
++    a,b,_=clients;x=create(a);name=b.get('/api/auth/me').json()['username'];rid=x['root']['id']
++    with ThreadPoolExecutor(max_workers=6) as pool:
++        codes=list(pool.map(lambda _:a.post('/api/library/questions/'+rid+'/shares',json={'username':name}).status_code,range(6)))
++    assert codes==[201]*6
++    assert len(a.get('/api/library/questions/'+rid+'/shares').json())==1
++
++def test_concurrent_bank_add_no_duplicates(clients):
++    a,_,_=clients;x=create(a);bank=a.post('/api/banks',json={'name':'并发题库'}).json()
++    with ThreadPoolExecutor(max_workers=6) as pool:
++        codes=list(pool.map(lambda _:a.post('/api/banks/'+bank['id']+'/items',json={'version_id':x['version']['id']}).status_code,range(6)))
++    assert codes==[201]*6
++    assert len(a.get('/api/banks/'+bank['id']+'/items').json())==1
++
++def test_restore_backup_new_database_only(clients,tmp_path):
++    from scripts.upgrade import backup
++    from scripts.restore_backup import restore
++    database=app.state.db;folder=tmp_path/'restore_case';backup(database,folder)
++    target='dm_project1_restore_test_'+uuid.uuid4().hex
++    client=database.client
++    try:
++        restored=restore(client,folder,target)
++        assert restored.surveys.count_documents({})==database.surveys.count_documents({})
++        assert restored.question_versions.index_information()['uq_root_version']['unique']
++        with pytest.raises(ValueError):restore(client,folder,target)
++        with pytest.raises(ValueError):restore(client,folder,database.name)
++    finally:
++        assert target.startswith('dm_project1_restore_test_');client.drop_database(target)
++
++def test_corrupt_backup_rejected_before_restore(clients,tmp_path):
++    from scripts.upgrade import backup
++    from scripts.restore_backup import restore
++    database=app.state.db;folder=tmp_path/'corrupt';record=backup(database,folder)
++    filename=next(iter(record['collections']))+'.bson';(folder/filename).write_bytes(b'broken')
++    target='dm_project1_restore_test_'+uuid.uuid4().hex
++    with pytest.raises(ValueError):restore(database.client,folder,target)
++    assert not database.client[target].list_collection_names()

@@ -1,5 +1,8 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
+  "compatible_legacy_versions": [
+    1
+  ],
   "collections": {
     "users": {
       "options": {
@@ -135,7 +138,8 @@
               },
               "schema_version": {
                 "enum": [
-                  1
+                  1,
+                  2
                 ]
               },
               "revision": {
@@ -177,6 +181,24 @@
             ],
             [
               "deadline",
+              1
+            ]
+          ]
+        },
+        "question_root_usage": {
+          "v": 2,
+          "key": [
+            [
+              "questions.source.root_id",
+              1
+            ]
+          ]
+        },
+        "question_version_usage": {
+          "v": 2,
+          "key": [
+            [
+              "questions.source.version_id",
               1
             ]
           ]
@@ -279,6 +301,298 @@
               "$type": "string"
             }
           }
+        }
+      }
+    },
+    "question_roots": {
+      "options": {
+        "validator": {
+          "$jsonSchema": {
+            "bsonType": "object",
+            "required": [
+              "owner_id",
+              "next_version",
+              "created_at"
+            ],
+            "properties": {
+              "owner_id": {
+                "bsonType": "objectId"
+              },
+              "next_version": {
+                "bsonType": "int"
+              },
+              "created_at": {
+                "bsonType": "date"
+              }
+            }
+          }
+        }
+      },
+      "indexes": {
+        "_id_": {
+          "v": 2,
+          "key": [
+            [
+              "_id",
+              1
+            ]
+          ]
+        },
+        "root_owner_recent": {
+          "v": 2,
+          "key": [
+            [
+              "owner_id",
+              1
+            ],
+            [
+              "created_at",
+              -1
+            ]
+          ]
+        }
+      }
+    },
+    "question_versions": {
+      "options": {
+        "validator": {
+          "$jsonSchema": {
+            "bsonType": "object",
+            "required": [
+              "root_id",
+              "number",
+              "definition",
+              "fingerprint",
+              "created_at"
+            ],
+            "properties": {
+              "root_id": {
+                "bsonType": "objectId"
+              },
+              "number": {
+                "bsonType": "int"
+              },
+              "definition": {
+                "bsonType": "object"
+              },
+              "fingerprint": {
+                "bsonType": "string"
+              },
+              "parent_version_id": {
+                "bsonType": [
+                  "objectId",
+                  "null"
+                ]
+              },
+              "created_at": {
+                "bsonType": "date"
+              }
+            }
+          }
+        }
+      },
+      "indexes": {
+        "_id_": {
+          "v": 2,
+          "key": [
+            [
+              "_id",
+              1
+            ]
+          ]
+        },
+        "uq_root_version": {
+          "v": 2,
+          "key": [
+            [
+              "root_id",
+              1
+            ],
+            [
+              "number",
+              -1
+            ]
+          ],
+          "unique": true
+        },
+        "version_parent": {
+          "v": 2,
+          "key": [
+            [
+              "parent_version_id",
+              1
+            ]
+          ]
+        }
+      }
+    },
+    "question_shares": {
+      "options": {
+        "validator": {
+          "$jsonSchema": {
+            "bsonType": "object",
+            "required": [
+              "root_id",
+              "grantee_id",
+              "created_at"
+            ],
+            "properties": {
+              "root_id": {
+                "bsonType": "objectId"
+              },
+              "grantee_id": {
+                "bsonType": "objectId"
+              },
+              "created_at": {
+                "bsonType": "date"
+              }
+            }
+          }
+        }
+      },
+      "indexes": {
+        "_id_": {
+          "v": 2,
+          "key": [
+            [
+              "_id",
+              1
+            ]
+          ]
+        },
+        "uq_root_grantee": {
+          "v": 2,
+          "key": [
+            [
+              "root_id",
+              1
+            ],
+            [
+              "grantee_id",
+              1
+            ]
+          ],
+          "unique": true
+        },
+        "grantee_roots": {
+          "v": 2,
+          "key": [
+            [
+              "grantee_id",
+              1
+            ],
+            [
+              "created_at",
+              -1
+            ]
+          ]
+        }
+      }
+    },
+    "question_banks": {
+      "options": {
+        "validator": {
+          "$jsonSchema": {
+            "bsonType": "object",
+            "required": [
+              "owner_id",
+              "name",
+              "revision",
+              "archived"
+            ],
+            "properties": {
+              "owner_id": {
+                "bsonType": "objectId"
+              },
+              "name": {
+                "bsonType": "string"
+              },
+              "revision": {
+                "bsonType": "int"
+              },
+              "archived": {
+                "bsonType": "bool"
+              }
+            }
+          }
+        }
+      },
+      "indexes": {
+        "_id_": {
+          "v": 2,
+          "key": [
+            [
+              "_id",
+              1
+            ]
+          ]
+        },
+        "owner_active_banks": {
+          "v": 2,
+          "key": [
+            [
+              "owner_id",
+              1
+            ],
+            [
+              "archived",
+              1
+            ]
+          ]
+        }
+      }
+    },
+    "bank_items": {
+      "options": {
+        "validator": {
+          "$jsonSchema": {
+            "bsonType": "object",
+            "required": [
+              "bank_id",
+              "root_id",
+              "version_id",
+              "updated_at"
+            ],
+            "properties": {
+              "bank_id": {
+                "bsonType": "objectId"
+              },
+              "root_id": {
+                "bsonType": "objectId"
+              },
+              "version_id": {
+                "bsonType": "objectId"
+              },
+              "updated_at": {
+                "bsonType": "date"
+              }
+            }
+          }
+        }
+      },
+      "indexes": {
+        "_id_": {
+          "v": 2,
+          "key": [
+            [
+              "_id",
+              1
+            ]
+          ]
+        },
+        "uq_bank_root": {
+          "v": 2,
+          "key": [
+            [
+              "bank_id",
+              1
+            ],
+            [
+              "root_id",
+              1
+            ]
+          ],
+          "unique": true
         }
       }
     }

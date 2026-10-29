@@ -1,9 +1,8 @@
 {
-  "recorded_at": "2026-10-22T22:37:29.100983+08:00",
+  "recorded_at": "2026-10-28T23:20:10.339034+08:00",
   "os": "Windows",
   "python": "3.12.15",
   "mongodb": "8.3.11",
-  "database_uri": "mongodb://127.0.0.1:27017/",
   "packages": {
     "fastapi": "0.159.1",
     "pymongo": "4.19.0",
@@ -12,5 +11,5 @@
     "pytest": "9.1.1",
     "httpx": "0.28.1"
   },
-  "test_result": "73 passed, 1 warning in 6.13s"
+  "test_evidence": "test-results-stage2.xml and test-run-stage2.txt; this export does not execute tests"
 }

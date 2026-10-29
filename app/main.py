@@ -17,6 +17,7 @@ from pymongo.errors import DuplicateKeyError, PyMongoError
 from .database import connect, initialize
 from .models import Account, SurveyInput, Submission, Preview, Question
 from .engine import inspect_rules, walk, AnswerError
+from .catalog_service import bind_sources
 
 UTC = timezone.utc
 ROOT = Path(__file__).parent
@@ -48,7 +49,7 @@ async def lifespan(app):
     yield
     client.close()
 
-app = FastAPI(title='问序 SurveyFlow · 第一阶段',version='1.0.0',lifespan=lifespan)
+app = FastAPI(title='问序 SurveyFlow · 第二阶段',version='2.0.0',lifespan=lifespan)
 app.mount('/static',StaticFiles(directory=ROOT/'static'),name='static')
 
 @app.middleware('http')
@@ -113,7 +114,7 @@ def home(sid:str=''):
 @app.get('/api/health')
 def health(database=Depends(db)):
     database.command('ping')
-    return {'status':'ok','database':database.name,'schema_version':1}
+    return {'status':'ok','database':database.name,'schema_version':2,'legacy_schema_versions':[1]}
 
 @app.post('/api/auth/register',status_code=201)
 def register(body:Account,database=Depends(db)):
@@ -148,7 +149,8 @@ def list_surveys(account=Depends(user),database=Depends(db),skip:int=Query(0,ge=
 @app.post('/api/surveys',status_code=201)
 def create(body:SurveyInput,account=Depends(user),database=Depends(db)):
     doc=body.model_dump()
-    doc.update(owner_id=account['_id'],status='draft',schema_version=1,revision=1,created_at=now(),updated_at=now(),submission_seq=0)
+    bind_sources(doc['questions'],account,database)
+    doc.update(owner_id=account['_id'],status='draft',schema_version=2,revision=1,created_at=now(),updated_at=now(),submission_seq=0)
     database.surveys.insert_one(doc)
     return public(doc)
 
@@ -158,14 +160,17 @@ def get_survey(sid:str,account=Depends(user),database=Depends(db)):
 
 @app.put('/api/surveys/{sid}')
 def update(sid:str,body:SurveyInput,revision:int=Query(...,ge=1),account=Depends(user),database=Depends(db)):
-    owned(sid,account,database)
-    result=database.surveys.find_one_and_update({'_id':oid(sid),'owner_id':account['_id'],'status':'draft','revision':revision},{'$set':{**body.model_dump(),'updated_at':now()},'$inc':{'revision':1}},return_document=ReturnDocument.AFTER)
+    survey=owned(sid,account,database)
+    data=body.model_dump()
+    bind_sources(data['questions'],account,database,survey)
+    result=database.surveys.find_one_and_update({'_id':oid(sid),'owner_id':account['_id'],'status':'draft','revision':revision},{'$set':{**data,'schema_version':2,'updated_at':now()},'$inc':{'revision':1}},return_document=ReturnDocument.AFTER)
     if not result: raise HTTPException(409,'仅可修改草稿，或版本已变化，请刷新后重试')
     return public(result)
 
 @app.post('/api/surveys/{sid}/questions')
 def add_question(sid:str,body:Question,revision:int=Query(...,ge=1),account=Depends(user),database=Depends(db)):
     survey=owned(sid,account,database)
+    bind_sources([body.model_dump()],account,database)
     if any(q['id']==body.id for q in survey['questions']): raise HTTPException(409,'题目 ID 已存在')
     result=database.surveys.find_one_and_update({'_id':oid(sid),'status':'draft','revision':revision,'questions.id':{'$ne':body.id},'questions.99':{'$exists':False}}, {'$push':{'questions':body.model_dump()},'$inc':{'revision':1},'$set':{'updated_at':now()}},return_document=ReturnDocument.AFTER)
     if not result: raise HTTPException(409,'草稿版本冲突、已发布或题目超过100道')
@@ -258,3 +263,8 @@ def list_responses(sid:str,skip:int=Query(0,ge=0),limit:int=Query(50,ge=1,le=100
     owned(sid,account,database)
     # Internal deduplication keys never leave the server.
     return public(list(database.responses.find({'survey_id':oid(sid)},{'respondent_key':0,'single_key':0,'request_id':0}).sort('submitted_at',-1).skip(skip).limit(limit)))
+
+
+# The stage-two router extends the same application; stage-one endpoints remain.
+from .catalog import router as catalog_router
+app.include_router(catalog_router)

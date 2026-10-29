@@ -29,6 +29,12 @@ class Rule(StrictModel):
     target: str = Field(min_length=1, max_length=40)
 
 
+class QuestionSource(StrictModel):
+    root_id: str = Field(pattern=r'^[a-f0-9]{24}$')
+    version_id: str = Field(pattern=r'^[a-f0-9]{24}$')
+    fingerprint: str = Field(pattern=r'^[a-f0-9]{64}$')
+
+
 class Question(StrictModel):
     id: str = Field(pattern=r'^[a-zA-Z][a-zA-Z0-9_]{0,39}$')
     title: str = Field(min_length=1, max_length=300)
@@ -37,6 +43,7 @@ class Question(StrictModel):
     options: list[str] = Field(default_factory=list, max_length=100)
     validation: Limits = Field(default_factory=Limits)
     rules: list[Rule] = Field(default_factory=list, max_length=50)
+    source: QuestionSource | None = None
 
     @field_validator('title')
     @classmethod

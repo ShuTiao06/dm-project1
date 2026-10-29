@@ -1,106 +1,60 @@
-# 问序 SurveyFlow
+# 问序 SurveyFlow 第二阶段
 
-《当代数据管理系统》大作业一第一阶段。Python FastAPI + PyMongo + 原生 HTML/CSS/JavaScript，所有业务数据存储于 MongoDB。未使用关系数据库，也未使用现成问卷系统框架。
+当代数据管理系统大作业一 · 葛一凡 · 10245501445。基于第一阶段增量扩展，使用FastAPI + PyMongo + MongoDB，网页无需构建。仓库：https://github.com/ShuTiao06/dm-project1
 
-## 三分钟启动
+## 第二阶段功能
 
-打开 **Anaconda Prompt**，逐行执行：
+常用题保存与复用、按用户名共享/撤销、不可变题目版本、历史与来源、任意旧版分支、恢复生成新版本、反向使用查询、题库创建/重命名/归档/条目管理、显式版本更新、跨问卷按确切版本统计。第一阶段四题型、配置跳转、规则体检、截止、提交、单卷统计和防重全部保留。
+
+103项自动测试已在真实MongoDB通过。证据见docs/test-results-stage2.xml、docs/test-run-stage2.txt；不是对其他电脑环境的保证。
+
+## 第二阶段启动与升级
+
+代码内容放到原项目根目录，勿套两层文件夹。MongoDB保持运行。关闭旧项目写入服务后，先备份升级，再启动：
 
 ```bat
 conda activate dm_project1
 cd /d "E:\当代数据管理系统\大作业\dm_project1"
-python run.py
+python scripts/upgrade.py
+python scripts/upgrade.py --apply --backup-dir private_backup\before_stage2_20261028
+python -m uvicorn app.main:app --host 127.0.0.1 --port 8002
 ```
 
-看到 `Uvicorn running on http://127.0.0.1:8000` 后，浏览器打开 **http://127.0.0.1:8000**。不要双击 HTML 文件。
+打开 [http://127.0.0.1:8002](http://127.0.0.1:8002)。已有依赖不用重装，新环境先执行 `python -m pip install -r requirements-lock.txt`。也可用python run.py启动8000端口。正式库默认dm_project1；演示库dm_project1_stage2_demo相互独立。
 
-首次使用：注册一个用户名（至少3位）和密码（至少8位），登录后点击“体验四题型示例”，点击“规则自动体检”，再点击“发布问卷”。注册不会自动预置用户；本次浏览器验收在当前电脑留下了 `survey_demo_1022` 演示账号和两份回答，项目压缩包不包含数据库数据。
+备份目录必须不存在，如已有同名目录换一个新名称。升级只添加集合、索引和允许的结构版本，不重写旧问卷和回答。启动也会幂等初始化，但已有数据建议先备份。备份含用户数据，不能上传GitHub。
 
-**你的环境已安装依赖，无需先重装。** 若在新电脑运行：
+需要恢复时，执行 `python scripts/restore_backup.py private_backup\before_stage2_20261028 --target-db dm_project1_restore`，工具校验全部SHA-256后恢复到不同名称的空数据库，拒绝覆盖原库或非空库。第一阶段回退应使用归档代码与恢复后的数据库，不要将第一阶段初始化器直接用于第二阶段新数据。
 
-```bat
-conda create -n dm_project1 python=3.12 -y
-conda activate dm_project1
-python -m pip install -r requirements-lock.txt
-python run.py
-```
+## 第二阶段验收
 
-`requirements-lock.txt` 是本次实测版本；`requirements.txt` 给出兼容范围。项目不依赖 transformers、huggingface-hub；截图里的相关缺包提示不参与本系统执行。
+1. 登录后进入“题目与版本”，新建年龄数字题v1；创建一个题库，将v1加入。
+2. 创建问卷A和B，各从题库导入同一v1，发布后分别提交20与40。
+3. 题目详情中查看跨问卷统计：2次作答、2份问卷、均值30。
+4. 基于v1修改生成v2；旧问卷仍用v1。恢复v1生成v3，不覆盖v1/v2。
+5. 题库提示新版，手动“采用最新版本”；已有问卷保持原内容。
+6. 另一个用户先注册，再按用户名共享。对方可使用/复制，不能修改原题。撤销共享不破坏已有问卷。
 
-## 解压放置
+导入题的定义锁定，跳转规则仍可在问卷内设置；需要改题应另建版本，或解除引用成为本地题。将旧问卷题“保存到常用题”只是另存副本，不追溯关联旧回答。全局统计仅所有者可看聚合，其他作者原始填空内容不返回；不同版本不混算。
 
-压缩包内只有一个 `dm_project1` 根文件夹。解压后把根文件夹**里面的内容**放到 `E:\当代数据管理系统\大作业\dm_project1`，避免出现 `dm_project1\dm_project1\run.py`。原有 `test_mongodb.py` 可以保留。
+## 当前测试与文档
 
-默认连接 `mongodb://127.0.0.1:27017/`，默认数据库 `dm_project1`。首次启动自动创建4个集合、BSON 校验器和索引。不会清空已有数据库。若同名集合里已有不兼容的数据，建议先改用新的数据库名，保留原数据：
-
-```bat
-set MONGODB_DB=dm_project1_stage1
-python run.py
-```
-
-`.env.example` 是配置说明，**程序不自动读取 .env**。用命令行环境变量配置 `MONGODB_URI`、`MONGODB_DB` 和 `SESSION_HOURS`（默认24）。PowerShell 对应 `$env:MONGODB_DB='dm_project1_stage1'`。
-
-## Spyder 运行
-
-确认 Spyder 控制台使用 `dm_project1` 的解释器。把工作目录设为项目根目录，打开 `run.py`，按 F5。服务器运行时控制台会持续占用，这是正常现象；浏览器里操作网页。停止时在控制台中断执行。如果已有一个服务器运行，勿再次 F5；否则会报告端口占用。
-
-若 Spyder 的交互事件循环报 `asyncio.run() cannot be called from a running event loop`，直接使用上面的 Anaconda Prompt 启动方式即可。项目不要求依赖 Spyder 才能运行。
-
-## 功能与验收
-
-1. 注册、登录；用户只能管理自己的问卷，作者专属统计与回答记录。
-2. 可视化创建草稿，添加、删除、移动题目，编辑约束与条件跳转。
-3. 单选、多选、文本、数字；多选精确数量可设最小值=最大值。
-4. 单选等于、多选包含/包含全部、数字比较/闭区间；按顺序取首个命中规则，默认进入下一题，支持跳至结束。
-5. 发布前自动体检：重复题号、非法选项、错误范围、题型不匹配、失效目标、回跳/循环、整数区间不可满足；提示多规则优先级风险。
-6. 发布后冻结内容；截止时间带时区；手动关闭；通过 `/survey/{id}` 分享。
-7. 登录后逐题填写，服务端检查路径和输入；被跳过的必答题不要求回答，伪造隐藏答案会被拒绝。
-8. 匿名表示不向作者暴露账号，仍需登录；可配置每账号单次或多次填写。唯一索引防并发重复，request_id 使网络重试幂等。
-9. MongoDB 实时统计选项次数、回答人数、全部填空内容（分页）、数字均值和极值；可查看整卷或单题。
-10. 保留答题路径和规则命中轨迹，支持解释跳转原因；保留独立第一阶段源码与设计快照。
-
-详细的5分钟演示见 [验收步骤](docs/acceptance.md)，输入/预期/实测见 [测试说明](docs/testing.md)。
-
-## 自动化测试
-
-MongoDB 保持运行，在项目根目录执行：
-
-```bat
-python -m pytest -q --junitxml=docs/test-results-local.xml
-```
-
-测试创建随机的 `dm_project1_test_<uuid>` 数据库，结束后只删除本次随机测试库；不操作正式 `dm_project1` 数据库。连接故障会明确失败，不会降级为内存模拟。
-
-已执行结果和环境见 `docs/testing.md`、`docs/test-results.xml`、`docs/test-run.txt`。请把自己重新执行的结果另存，勿将未经运行的用例写成通过。
-
-## 文档导航
+执行 `python -m pytest -q --junitxml=docs/test-results-local.xml`，包含原73项回归与30项新增用例。测试仅清除自己创建的随机测试库，绝不清空正式库。受限环境可加 `--basetemp=work\pytest-local-1`，指定一个新建临时目录。
 
 | 文档 | 内容 |
 |---|---|
-| [项目完成报告](docs/report.md) | 项目目标、设计、创新、测试、问题、AI使用总结 |
-| [可打印报告](docs/项目完成报告.html) | 浏览器打开阅读、打印或另存为PDF；提交前填写姓名学号 |
-| [数据库设计](docs/database-design.md) | 四集合设计、样例、嵌入/引用取舍、索引和一致性 |
-| [API说明](docs/api.md) | 所有接口、权限、请求样例、错误码 |
-| [关键逻辑](docs/logic.md) | 规则语义、校验顺序、状态与并发 |
-| [测试说明](docs/testing.md) | 真实结果、输入输出、覆盖与限制 |
-| [AI使用日志](docs/ai-log.md) | 本次真实提示词、产物、缺陷修复、贡献边界 |
-| [未来演化设计](docs/evolution.md) | 第二阶段只作设计，未实现题库、共享、版本管理 |
-| [提交清单](docs/submission-checklist.md) | 提交前本地验收和个人信息填写 |
+| docs/report-stage2.md | 第二阶段项目完成报告 |
+| docs/第二阶段项目完成报告.html | 浏览器可读报告 |
+| docs/2026_ECNU_PJ1_2_葛一凡.pdf | 水杉提交PDF，开头为同一GitHub链接 |
+| docs/database-stage2.md | 数据模型、索引、不可变版本、权限与统计 |
+| docs/api-stage2.md | 新增API、请求和返回 |
+| docs/testing-stage2.md | 实测输入输出、结果与浏览器证据 |
+| docs/migration-stage2.md | 升级、兼容、备份恢复和差异 |
+| docs/ai-log-stage2.md | 第二阶段真实AI使用日志 |
 
-运行后 `http://127.0.0.1:8000/docs` 提供 Swagger UI（页面的外部资源需要联网）；完全离线时可以使用 `docs/api.md` 和 `docs/openapi.json`。`/api/health` 检查数据库连接，`python scripts/inspect_db.py` 查看真实集合计数与索引。
+第一阶段基线ZIP和清单不变，运行 `python scripts/verify_stage1_archive.py` 验证归档。旧verify_snapshot.py比较工作树与第一阶段，在第二阶段出现预期差异；不应覆盖基线消除差异。
 
-## 第一阶段快照
+更新到第一阶段同一个GitHub仓库，保留历史，不删除重建。排除private_backup、.bson、.env和缓存。水杉提交2026_ECNU_PJ1_2_葛一凡.pdf，截止2026年10月30日00:00北京时间，即29日晚结束。本地系统未做公网部署、大规模压测或生产级灾难恢复；跨卷作答次数不是独立人数。
 
-`snapshots/stage1_baseline.zip` 保存本阶段代码和设计，`stage1_manifest.json` 保存逐文件 SHA-256 与压缩包校验和。执行 `python scripts/verify_snapshot.py` 可检查当前文件与基线是否一致。`snapshot.py` 拒绝覆盖已有快照。后续第二阶段应在当前核心结构上增量演化，不修改已归档快照。
 
-## 常见问题
-
-- `ModuleNotFoundError`：先激活 dm_project1，使用 `python -m pip`，避免依赖装入另一个解释器。
-- `ServerSelectionTimeoutError`：检查 MongoDB 服务、地址和端口。启动失败不会退回其他数据库。
-- `WinError 10048`：8000端口已有进程。关闭之前的项目服务，或运行 `python -m uvicorn app.main:app --host 127.0.0.1 --port 8001`。
-- 登录后仍显示登录页：全程使用同一个地址，勿在 localhost 与 127.0.0.1 之间切换，两者 Cookie 不共享。
-- 发布失败：先看体检错误，确保 ID 唯一、规则目标位于后面、截止时间在未来。
-- “草稿版本冲突”：另一页面已保存过；返回列表重新打开，避免覆盖更新。
-- 测试输出 StarletteDeprecationWarning：当前实测版本仍可执行，属于测试客户端的未来弃用提示，已如实记录。
-
-本项目定位为本地课程验收。默认只监听本机地址，不含公网部署、账号找回、验证码、自动保存未提交答案和题库等功能。浏览器刷新会丢失未提交答案；返回上一题会清除该题及其后路径的答案，以免旧分支数据混入。
+第一阶段原始说明保留在docs/README-stage1-original.md与归档ZIP内。
